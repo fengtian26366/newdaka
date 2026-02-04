@@ -437,7 +437,7 @@ async def export_xlsx(chat_id: int, start_d: date, end_d: date) -> bytes:
 
 # ===== Bot =====
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(allowed_updates=["message", "edited_message"])
 
 @dp.message(CommandStart())
 async def start(m: Message):
@@ -607,11 +607,17 @@ async def group_listener(m: Message):
 
             asyncio.create_task(remind_later(m.chat.id, uid, shift_date, shift_type, kind, limit_min))
             return
+await bot.delete_webhook(drop_pending_updates=True)
 
 async def main():
     await db_init()
+
+    # 🔥 这行必须在 start_polling 之前
+    await bot.delete_webhook(drop_pending_updates=True)
+
     print("[bot] polling started")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
