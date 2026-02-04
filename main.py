@@ -21,7 +21,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 # 可选：只允许这些管理员私聊配置（逗号分隔）
-ADMIN_IDS = set()
+ADMIN_IDS = set(8007220803)
 _admin_raw = os.getenv("ADMIN_IDS", "").strip()
 if _admin_raw:
     for x in _admin_raw.split(","):
