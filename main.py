@@ -611,13 +611,12 @@ await bot.delete_webhook(drop_pending_updates=True)
 
 async def main():
     await db_init()
-
-    # 🔥 这行必须在 start_polling 之前
-    await bot.delete_webhook(drop_pending_updates=True)
-
+    await bot.delete_webhook(drop_pending_updates=True)  # ✅ 放这里
     print("[bot] polling started")
     await dp.start_polling(bot)
 
 
+
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
