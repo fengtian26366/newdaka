@@ -607,7 +607,6 @@ async def group_listener(m: Message):
 
             asyncio.create_task(remind_later(m.chat.id, uid, shift_date, shift_type, kind, limit_min))
             return
-await bot.delete_webhook(drop_pending_updates=True)
 
 async def main():
     await db_init()
