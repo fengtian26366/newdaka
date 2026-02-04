@@ -1,5 +1,7 @@
 import os
 import re
+import math
+import random
 import asyncio
 from io import BytesIO
 from datetime import datetime, timedelta, date, time
@@ -26,10 +28,11 @@ if not BOT_TOKEN or not DATABASE_URL:
 
 TZ = ZoneInfo("Asia/Colombo")
 
-# ====== 写死规则（你确认的）======
+# ====== 写死班次（斯里兰卡）======
 SHIFT_DAY_START = time(7, 0)
 SHIFT_DAY_END = time(19, 0)   # 19:00 切到夜班（>=19:00 是夜班）
 
+# ====== 写死规则（次数限制 + 单次上限分钟）======
 BREAK_RULES = {
     "PEE":   {"minutes": 6,  "max_count": 3, "aliases": ["小便", "尿", "pee"]},
     "POOP":  {"minutes": 15, "max_count": 2, "aliases": ["大便", "拉屎", "poop"]},
@@ -37,8 +40,18 @@ BREAK_RULES = {
     "SMOKE": {"minutes": 10, "max_count": 5, "aliases": ["抽烟", "抽", "smoke"]},
 }
 
-WORKIN_ALIASES = ["上班", "开工", "in", "start", "work in"]
+WORKIN_ALIASES = ["上班", "开工", "开工了", "上工", "in", "start", "work in", "到岗", "开工吧", "开工呀"]
+BACK_ALIASES = ["回", "回来", "back", "/back", "1", "/1", "结束", "return", "回来了"]
+
 TOTAL_BREAK_LIMIT_MIN = 188
+
+WORKIN_REPLIES = [
+    "✅ 上班已记录，辛苦啦，今天稳住就赢了。",
+    "✅ 到岗了，挺靠谱的，继续保持。",
+    "✅ 已打卡上班，感谢配合。",
+    "✅ 上班记录成功，今天加油。",
+    "✅ 到岗确认，做得不错。",
+]
 
 def is_admin(user_id: int) -> bool:
     return (not ADMIN_IDS) or (user_id in ADMIN_IDS)
@@ -79,6 +92,20 @@ def local_str(dt_utc: datetime | None) -> str:
     if dt_utc.tzinfo is None:
         dt_utc = dt_utc.replace(tzinfo=ZoneInfo("UTC"))
     return dt_utc.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+def kind_cn(kind: str) -> str:
+    return {"PEE": "小便", "POOP": "大便", "EAT": "吃饭", "SMOKE": "抽烟"}.get(kind, kind)
+
+def compute_violation(counts: dict, mins: dict) -> tuple[bool, str]:
+    reasons = []
+    total_min = sum(mins.values())
+    if total_min > TOTAL_BREAK_LIMIT_MIN:
+        reasons.append(f"总离岗{total_min}>{TOTAL_BREAK_LIMIT_MIN}")
+
+    for k, rule in BREAK_RULES.items():
+        if counts.get(k, 0) > rule["max_count"]:
+            reasons.append(f"{k}次数{counts[k]}>{rule['max_count']}")
+    return (len(reasons) > 0, "; ".join(reasons))
 
 DDL = """
 CREATE TABLE IF NOT EXISTS tg_groups (
@@ -122,6 +149,24 @@ CREATE TABLE IF NOT EXISTS shift_attendance (
 );
 
 CREATE INDEX IF NOT EXISTS idx_shift_date ON shift_attendance(chat_id, shift_date);
+
+-- 进行中的离岗会话（重启不丢）
+CREATE TABLE IF NOT EXISTS break_sessions (
+  chat_id BIGINT NOT NULL,
+  user_id BIGINT NOT NULL,
+  shift_date DATE NOT NULL,
+  shift_type TEXT NOT NULL,      -- DAY/NIGHT
+  kind TEXT NOT NULL,            -- PEE/POOP/EAT/SMOKE
+  start_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  limit_min INT NOT NULL,
+
+  start_msg_id BIGINT NULL,      -- “已记录/请在xx前回来”
+  remind_msg_id BIGINT NULL,     -- “已到上限请回来”
+
+  PRIMARY KEY(chat_id, user_id, shift_date, shift_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_break_sessions_chat ON break_sessions(chat_id);
 """
 
 pool: asyncpg.Pool | None = None
@@ -180,21 +225,66 @@ async def update_workin(chat_id: int, shift_date: date, shift_type: str, user_id
             chat_id, shift_date, shift_type, user_id
         )
 
-def compute_violation(counts: dict, mins: dict) -> tuple[bool, str]:
-    reasons = []
-    total_min = sum(mins.values())
-    if total_min > TOTAL_BREAK_LIMIT_MIN:
-        reasons.append(f"总离岗{total_min}>{TOTAL_BREAK_LIMIT_MIN}")
-
-    for k, rule in BREAK_RULES.items():
-        if counts.get(k, 0) > rule["max_count"]:
-            reasons.append(f"{k}次数{counts[k]}>{rule['max_count']}")
-    return (len(reasons) > 0, "; ".join(reasons))
-
-async def update_break(chat_id: int, shift_date: date, shift_type: str, user_id: int, kind: str):
-    rule = BREAK_RULES[kind]
+async def get_active_session(chat_id: int, shift_date: date, shift_type: str, user_id: int):
     async with pool.acquire() as conn:
-        # 先加计数与分钟
+        return await conn.fetchrow(
+            """
+            SELECT kind, start_at, limit_min, start_msg_id, remind_msg_id
+            FROM break_sessions
+            WHERE chat_id=$1 AND shift_date=$2 AND shift_type=$3 AND user_id=$4
+            """,
+            chat_id, shift_date, shift_type, user_id
+        )
+
+async def start_break_session(chat_id: int, shift_date: date, shift_type: str, user_id: int, kind: str, limit_min: int, start_msg_id: int):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO break_sessions(chat_id, user_id, shift_date, shift_type, kind, limit_min, start_msg_id)
+            VALUES($1,$2,$3,$4,$5,$6,$7)
+            ON CONFLICT(chat_id, user_id, shift_date, shift_type)
+            DO UPDATE SET kind=EXCLUDED.kind, start_at=NOW(), limit_min=EXCLUDED.limit_min,
+                         start_msg_id=EXCLUDED.start_msg_id, remind_msg_id=NULL
+            """,
+            chat_id, user_id, shift_date, shift_type, kind, limit_min, start_msg_id
+        )
+
+async def set_remind_msg(chat_id: int, shift_date: date, shift_type: str, user_id: int, remind_msg_id: int):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE break_sessions SET remind_msg_id=$5
+            WHERE chat_id=$1 AND shift_date=$2 AND shift_type=$3 AND user_id=$4
+            """,
+            chat_id, shift_date, shift_type, user_id, remind_msg_id
+        )
+
+async def end_break_session(chat_id: int, shift_date: date, shift_type: str, user_id: int):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT kind, start_at, limit_min, start_msg_id, remind_msg_id
+            FROM break_sessions
+            WHERE chat_id=$1 AND shift_date=$2 AND shift_type=$3 AND user_id=$4
+            """,
+            chat_id, shift_date, shift_type, user_id
+        )
+        if not row:
+            return None
+        await conn.execute(
+            """
+            DELETE FROM break_sessions
+            WHERE chat_id=$1 AND shift_date=$2 AND shift_type=$3 AND user_id=$4
+            """,
+            chat_id, shift_date, shift_type, user_id
+        )
+        return row
+
+async def add_break_result(chat_id: int, shift_date: date, shift_type: str, user_id: int, kind: str, used_seconds: int):
+    used_min = max(1, math.ceil(used_seconds / 60))
+
+    async with pool.acquire() as conn:
+        # 次数+1，用时累加
         await conn.execute(
             f"""
             UPDATE shift_attendance
@@ -203,10 +293,9 @@ async def update_break(chat_id: int, shift_date: date, shift_type: str, user_id:
                 last_action_at = NOW()
             WHERE chat_id=$1 AND shift_date=$2 AND shift_type=$3 AND user_id=$4
             """,
-            chat_id, shift_date, shift_type, user_id, rule["minutes"]
+            chat_id, shift_date, shift_type, user_id, used_min
         )
 
-        # 取当前统计计算违规
         row = await conn.fetchrow(
             """
             SELECT pee_count, poop_count, eat_count, smoke_count,
@@ -216,6 +305,7 @@ async def update_break(chat_id: int, shift_date: date, shift_type: str, user_id:
             """,
             chat_id, shift_date, shift_type, user_id
         )
+
         counts = {"PEE": row["pee_count"], "POOP": row["poop_count"], "EAT": row["eat_count"], "SMOKE": row["smoke_count"]}
         mins = {"PEE": row["pee_min"], "POOP": row["poop_min"], "EAT": row["eat_min"], "SMOKE": row["smoke_min"]}
         viol, reason = compute_violation(counts, mins)
@@ -229,15 +319,15 @@ async def update_break(chat_id: int, shift_date: date, shift_type: str, user_id:
             chat_id, shift_date, shift_type, user_id, viol, reason
         )
 
+    return used_min, counts, mins, viol, reason
+
 async def export_xlsx(chat_id: int, start_d: date, end_d: date) -> bytes:
-    # end_d inclusive
     async with pool.acquire() as conn:
         users = await conn.fetch(
             "SELECT user_id, user_name FROM known_users WHERE chat_id=$1 ORDER BY user_name NULLS LAST, user_id",
             chat_id
         )
 
-        # 构造所有班次 key
         shifts = []
         d = start_d
         while d <= end_d:
@@ -245,7 +335,6 @@ async def export_xlsx(chat_id: int, start_d: date, end_d: date) -> bytes:
             shifts.append((d, "NIGHT"))
             d += timedelta(days=1)
 
-        # 把已有记录一次性拉出来
         rows = await conn.fetch(
             """
             SELECT shift_date, shift_type, user_id, user_name, first_in_at,
@@ -258,16 +347,12 @@ async def export_xlsx(chat_id: int, start_d: date, end_d: date) -> bytes:
             chat_id, start_d, end_d
         )
 
-    data_map = {}
-    for r in rows:
-        key = (r["shift_date"], r["shift_type"], int(r["user_id"]))
-        data_map[key] = r
+    data_map = {(r["shift_date"], r["shift_type"], int(r["user_id"])): r for r in rows}
 
     wb = Workbook()
-
-    # Sheet 1: summary
     ws = wb.active
     ws.title = "summary"
+
     headers = [
         "shift_date", "shift_type", "user_id", "user_name",
         "clock_in_time(Colombo)", "status",
@@ -326,18 +411,16 @@ async def export_xlsx(chat_id: int, start_d: date, end_d: date) -> bytes:
                 for cell in ws[row_idx]:
                     cell.fill = yellow_fill
 
-    # Sheet 2: rules
     ws2 = wb.create_sheet("rules")
     ws2.append(["timezone", "Asia/Colombo"])
     ws2.append(["shift DAY", "07:00-18:59"])
     ws2.append(["shift NIGHT", "19:00-06:59 (belongs to shift_date of 19:00 day)"])
     ws2.append(["TOTAL_BREAK_LIMIT_MIN", TOTAL_BREAK_LIMIT_MIN])
     ws2.append([])
-    ws2.append(["TYPE", "minutes_each", "max_count", "aliases"])
+    ws2.append(["TYPE", "minutes_each(单次上限)", "max_count(次数上限)", "aliases"])
     for k, v in BREAK_RULES.items():
         ws2.append([k, v["minutes"], v["max_count"], ", ".join(v["aliases"])])
 
-    # autosize (简单处理)
     for sheet in (ws, ws2):
         for col in sheet.columns:
             max_len = 0
@@ -351,7 +434,7 @@ async def export_xlsx(chat_id: int, start_d: date, end_d: date) -> bytes:
     wb.save(bio)
     return bio.getvalue()
 
-# ====== Bot ======
+# ===== Bot =====
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -363,44 +446,16 @@ async def start(m: Message):
             return
         await m.reply(
             "✅ 打卡机器人已启动（写死规则版）\n\n"
-            "群里直接发：上班/in、吃饭/eat、小便/pee、大便/poop、抽烟/smoke\n"
+            "群里发：上班/in/开工；离岗：吃饭/eat、小便/pee、大便/poop、抽烟/抽/smoke\n"
+            "回来：回 / back / 1 / 结束\n"
             "（不打下班，按斯里兰卡时间自动分白班/夜班）\n\n"
-            "私聊导出：\n"
-            "/export <chat_id> 2026-02-01 2026-02-05\n"
+            "导出：/export <chat_id> YYYY-MM-DD YYYY-MM-DD\n"
             "示例：/export -1001234567890 2026-02-01 2026-02-05\n\n"
-            "如何拿 chat_id：把机器人拉进群，在群里随便发一句，机器人会记录群；你也可以让我后续加 /mygroups 自动列群。"
+            "⚠️ 提醒：机器人需要群管理员权限才能删提示消息。"
         )
     else:
         await upsert_group(m.chat.id, m.chat.title or "")
-        await m.reply("✅ 已加入群。直接发 上班/吃饭/eat/抽烟/小便/大便 即可记录。")
-
-@dp.message(F.chat.type.in_(["group", "supergroup"]) & F.text)
-async def group_listener(m: Message):
-    await upsert_group(m.chat.id, m.chat.title or "")
-
-    text = norm_text(m.text)
-    if not text:
-        return
-
-    uid = m.from_user.id
-    uname = m.from_user.full_name or (m.from_user.username or str(uid))
-    await upsert_known_user(m.chat.id, uid, uname)
-
-    now_local = datetime.now(tz=TZ)
-    shift_date, shift_type = get_shift(now_local)
-
-    await get_or_create_shift_row(m.chat.id, shift_date, shift_type, uid, uname)
-
-    # 上班
-    if contains_any(text, WORKIN_ALIASES):
-        await update_workin(m.chat.id, shift_date, shift_type, uid)
-        return
-
-    # 离岗类型
-    for kind, rule in BREAK_RULES.items():
-        if contains_any(text, rule["aliases"]):
-            await update_break(m.chat.id, shift_date, shift_type, uid, kind)
-            return
+        await m.reply("✅ 已加入群。直接发 上班/吃饭/eat/抽烟/小便/大便 即可记录；回来发：回/back/1/结束。")
 
 @dp.message(Command("export"))
 async def export_cmd(m: Message):
@@ -436,8 +491,125 @@ async def export_cmd(m: Message):
     fn = f"attendance_{chat_id}_{start_d.strftime('%Y%m%d')}_{end_d.strftime('%Y%m%d')}.xlsx"
     await m.reply_document(BufferedInputFile(data, filename=fn), caption="✅ 导出完成（红色=MISSING，黄色=违规）")
 
+@dp.message(F.chat.type.in_(["group", "supergroup"]) & Command("chatid"))
+async def chatid_cmd(m: Message):
+    await m.reply(f"chat_id={m.chat.id}\n群名：{m.chat.title or ''}")
+
+@dp.message(F.chat.type.in_(["group", "supergroup"]) & F.text)
+async def group_listener(m: Message):
+    await upsert_group(m.chat.id, m.chat.title or "")
+
+    text = norm_text(m.text)
+    if not text:
+        return
+
+    uid = m.from_user.id
+    uname = m.from_user.full_name or (m.from_user.username or str(uid))
+    await upsert_known_user(m.chat.id, uid, uname)
+
+    now_local = datetime.now(tz=TZ)
+    shift_date, shift_type = get_shift(now_local)
+    await get_or_create_shift_row(m.chat.id, shift_date, shift_type, uid, uname)
+
+    # ① 回来：结束离岗
+    if contains_any(text, BACK_ALIASES):
+        sess = await end_break_session(m.chat.id, shift_date, shift_type, uid)
+        if not sess:
+            await m.reply("你当前没有进行中的离岗记录。")
+            return
+
+        kind = sess["kind"]
+        start_at = sess["start_at"]
+        limit_min = int(sess["limit_min"])
+        start_msg_id = sess["start_msg_id"]
+        remind_msg_id = sess["remind_msg_id"]
+
+        # 删除“开始提示 + 超时提醒”（需要机器人有删消息权限）
+        for mid in [start_msg_id, remind_msg_id]:
+            if mid:
+                try:
+                    await bot.delete_message(m.chat.id, int(mid))
+                except:
+                    pass
+
+        # 计算真实用时
+        # asyncpg 取出的 timestamp 通常是 naive，这里按 Colombo 解释
+        if start_at.tzinfo is None:
+            start_local = start_at.replace(tzinfo=TZ)
+        else:
+            start_local = start_at.astimezone(TZ)
+
+        used_seconds = int((datetime.now(tz=TZ) - start_local).total_seconds())
+        used_min, counts, mins, viol, reason = await add_break_result(m.chat.id, shift_date, shift_type, uid, kind, used_seconds)
+
+        overtime = used_min > limit_min
+        left_times = BREAK_RULES[kind]["max_count"] - counts[kind]
+        total_break = sum(mins.values())
+
+        msg = (
+            f"✅ {uname} {kind_cn(kind)} 本次结束，用时 {used_min} 分钟（上限 {limit_min} 分钟）{'⚠️已超时' if overtime else ''}\n"
+            f"本班累计：{kind_cn(kind)} 第 {counts[kind]} 次（剩余 {max(left_times,0)} 次），累计离岗 {total_break} 分钟。\n"
+            f"{'⚠️违规：'+reason if viol else '正常'}"
+        )
+        await m.reply(msg)
+        return
+
+    # ② 上班：回复欣慰话
+    if contains_any(text, WORKIN_ALIASES):
+        await update_workin(m.chat.id, shift_date, shift_type, uid)
+        await m.reply(random.choice(WORKIN_REPLIES))
+        return
+
+    # ③ 离岗开始
+    for kind, rule in BREAK_RULES.items():
+        if contains_any(text, rule["aliases"]):
+            active = await get_active_session(m.chat.id, shift_date, shift_type, uid)
+            if active:
+                await m.reply(f"你正在 {kind_cn(active['kind'])} 中，请先发送：回 / back / 1 / 结束。")
+                return
+
+            # 当前次数
+            async with pool.acquire() as conn:
+                r = await conn.fetchrow(
+                    f"""
+                    SELECT {kind.lower()}_count AS c
+                    FROM shift_attendance
+                    WHERE chat_id=$1 AND shift_date=$2 AND shift_type=$3 AND user_id=$4
+                    """,
+                    m.chat.id, shift_date, shift_type, uid
+                )
+            used_count = int(r["c"]) if r else 0
+            next_count = used_count + 1
+            max_count = rule["max_count"]
+            limit_min = rule["minutes"]
+
+            deadline = datetime.now(tz=TZ) + timedelta(minutes=limit_min)
+            start_msg = await m.reply(
+                f"⏰ ✅ 已记录：{uname} {kind_cn(kind)}（第 {next_count} 次 / 限制 {max_count} 次）\n"
+                f"请在 {deadline.strftime('%H:%M')} 前回来：回 / back / 1 / 结束"
+            )
+            await start_break_session(m.chat.id, shift_date, shift_type, uid, kind, limit_min, start_msg.message_id)
+
+            # 到点提醒（简单版：重启会丢提醒，但“回来总结/累计”不会丢）
+            async def remind_later(chat_id: int, user_id: int, sd: date, st: str, kind_: str, limit_: int):
+                await asyncio.sleep(limit_ * 60)
+                still = await get_active_session(chat_id, sd, st, user_id)
+                if still and still["kind"] == kind_:
+                    try:
+                        rm = await bot.send_message(
+                            chat_id,
+                            f"⏰ @{m.from_user.username or uname} 的 {kind_cn(kind_)} 已到上限 {limit_} 分，请尽快回来：回 / back / 1 / 结束"
+                        )
+                        await set_remind_msg(chat_id, sd, st, user_id, rm.message_id)
+                    except:
+                        pass
+
+            asyncio.create_task(remind_later(m.chat.id, uid, shift_date, shift_type, kind, limit_min))
+            return
+
 async def main():
     await db_init()
+    print("[bot] polling started")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
