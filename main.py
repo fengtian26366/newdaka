@@ -5,7 +5,7 @@ import csv
 import asyncio
 from datetime import datetime, timedelta, date, time
 from zoneinfo import ZoneInfo
-from typing import Optional, Tuple
+from typing import Optional
 
 import asyncpg
 from aiogram import Bot, Dispatcher, F
@@ -31,6 +31,7 @@ TZ = ZoneInfo("Asia/Colombo")  # 斯里兰卡
 DAY_CUT = time(7, 0)           # 07:00 作为“日界”
 LATE_GRACE_MIN = 10            # 迟到宽限（分钟）你要改就在这里改
 
+
 def parse_admin_ids(raw: str) -> set[int]:
     if not raw:
         return set()
@@ -40,6 +41,7 @@ def parse_admin_ids(raw: str) -> set[int]:
         if x.isdigit():
             out.add(int(x))
     return out
+
 
 ADMIN_IDS = parse_admin_ids(ADMIN_IDS_RAW)
 
@@ -119,12 +121,14 @@ KB = ReplyKeyboardMarkup(
 def now_sl() -> datetime:
     return datetime.now(tz=TZ)
 
+
 def work_day(dt: datetime) -> date:
     """工作日标签：07:00 ~ 次日07:00 算同一天。"""
     lt = dt.astimezone(TZ)
     if lt.time() >= DAY_CUT:
         return lt.date()
     return (lt.date() - timedelta(days=1))
+
 
 def infer_shift(dt: datetime) -> str:
     """自动判班：07:00-19:00 白班；19:00-次日07:00 夜班。"""
@@ -134,6 +138,7 @@ def infer_shift(dt: datetime) -> str:
         return "白班"
     return "夜班"
 
+
 def shift_start_dt(wd: date, shift: str) -> datetime:
     """给定 work_day + shift，返回该班次开始时间（斯里兰卡）。"""
     if shift == "白班":
@@ -141,9 +146,35 @@ def shift_start_dt(wd: date, shift: str) -> datetime:
     # 夜班开始在同一个 work_day 的 19:00
     return datetime.combine(wd, time(19, 0), TZ)
 
+
 def is_on_time(checkin_at: datetime, wd: date, shift: str) -> bool:
     start = shift_start_dt(wd, shift)
     return checkin_at <= (start + timedelta(minutes=LATE_GRACE_MIN))
+
+
+def get_tg_name(message: Message) -> str:
+    """
+    导出用的“用户名字”：优先 full_name，其次 username，再次 user_id
+    """
+    u = message.from_user
+    if not u:
+        return ""
+    name = (u.full_name or "").strip()
+    if name:
+        return name
+    if u.username:
+        return f"@{u.username}"
+    return str(u.id)
+
+
+async def safe_delete(chat_id: int, message_id: int):
+    """
+    安全删除消息：没有权限/删不了就忽略
+    """
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
 
 
 # =========================
@@ -158,6 +189,7 @@ async def db_init():
         CREATE TABLE IF NOT EXISTS shift_summary (
             chat_id BIGINT NOT NULL,
             tg_user_id BIGINT NOT NULL,
+            tg_name TEXT,                   -- ✅ 新增：记录昵称/名字
             work_day DATE NOT NULL,          -- 07:00 切日标签
             shift TEXT NOT NULL,             -- 白班/夜班
             checkin_at TIMESTAMPTZ,
@@ -176,6 +208,9 @@ async def db_init():
             PRIMARY KEY (chat_id, tg_user_id, work_day, shift)
         );
         """)
+
+        # ✅ 兼容老库：如果以前没有 tg_name 列，补上
+        await conn.execute("ALTER TABLE shift_summary ADD COLUMN IF NOT EXISTS tg_name TEXT;")
 
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS active_session (
@@ -218,6 +253,7 @@ async def get_user_shift(chat_id: int, tg_user_id: int, dt: datetime) -> str:
         return row["shift"]
     return infer_shift(dt)
 
+
 async def set_user_shift(chat_id: int, tg_user_id: int, shift: str):
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -227,12 +263,14 @@ async def set_user_shift(chat_id: int, tg_user_id: int, shift: str):
         SET shift=EXCLUDED.shift, updated_at=NOW()
         """, chat_id, tg_user_id, shift)
 
+
 async def get_active(chat_id: int, tg_user_id: int):
     async with pool.acquire() as conn:
         return await conn.fetchrow(
             "SELECT * FROM active_session WHERE chat_id=$1 AND tg_user_id=$2",
             chat_id, tg_user_id
         )
+
 
 async def set_active(chat_id: int, tg_user_id: int, wd: date, shift: str, kind: str, start_at: datetime, msg1: int, msg2: int):
     async with pool.acquire() as conn:
@@ -248,19 +286,26 @@ async def set_active(chat_id: int, tg_user_id: int, wd: date, shift: str, kind: 
             msg2=EXCLUDED.msg2
         """, chat_id, tg_user_id, wd, shift, kind, start_at, msg1, msg2)
 
+
 async def clear_active(chat_id: int, tg_user_id: int):
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM active_session WHERE chat_id=$1 AND tg_user_id=$2", chat_id, tg_user_id)
         await conn.execute("DELETE FROM active_session WHERE chat_id=$1 AND tg_user_id=$2", chat_id, tg_user_id)
         return row
 
-async def ensure_summary_row(chat_id: int, tg_user_id: int, wd: date, shift: str):
+
+async def ensure_summary_row(chat_id: int, tg_user_id: int, tg_name: str, wd: date, shift: str):
+    """
+    ✅ 确保汇总行存在，并顺手更新 tg_name（昵称会变，所以每次都覆盖一下）
+    """
     async with pool.acquire() as conn:
         await conn.execute("""
-        INSERT INTO shift_summary(chat_id, tg_user_id, work_day, shift)
-        VALUES($1,$2,$3,$4)
-        ON CONFLICT DO NOTHING
-        """, chat_id, tg_user_id, wd, shift)
+        INSERT INTO shift_summary(chat_id, tg_user_id, tg_name, work_day, shift)
+        VALUES($1,$2,$3,$4,$5)
+        ON CONFLICT(chat_id, tg_user_id, work_day, shift)
+        DO UPDATE SET tg_name=EXCLUDED.tg_name, updated_at=NOW()
+        """, chat_id, tg_user_id, tg_name, wd, shift)
+
 
 async def get_checkin_time(chat_id: int, tg_user_id: int, wd: date, shift: str) -> Optional[datetime]:
     async with pool.acquire() as conn:
@@ -268,6 +313,7 @@ async def get_checkin_time(chat_id: int, tg_user_id: int, wd: date, shift: str) 
         SELECT checkin_at FROM shift_summary
         WHERE chat_id=$1 AND tg_user_id=$2 AND work_day=$3 AND shift=$4
         """, chat_id, tg_user_id, wd, shift)
+
 
 async def get_kind_count(chat_id: int, tg_user_id: int, wd: date, shift: str, kind: str) -> int:
     col = f"{kind}_count"
@@ -277,6 +323,7 @@ async def get_kind_count(chat_id: int, tg_user_id: int, wd: date, shift: str, ki
         WHERE chat_id=$1 AND tg_user_id=$2 AND work_day=$3 AND shift=$4
         """, chat_id, tg_user_id, wd, shift) or 0)
 
+
 async def add_checkin(chat_id: int, tg_user_id: int, wd: date, shift: str, checkin_at: datetime):
     ot = is_on_time(checkin_at, wd, shift)
     async with pool.acquire() as conn:
@@ -285,6 +332,7 @@ async def add_checkin(chat_id: int, tg_user_id: int, wd: date, shift: str, check
         SET checkin_at=$1, on_time=$2, updated_at=NOW()
         WHERE chat_id=$3 AND tg_user_id=$4 AND work_day=$5 AND shift=$6
         """, checkin_at, ot, chat_id, tg_user_id, wd, shift)
+
 
 async def add_break_result(chat_id: int, tg_user_id: int, wd: date, shift: str, kind: str, used_min: int):
     # 累加次数+分钟
@@ -299,10 +347,11 @@ async def add_break_result(chat_id: int, tg_user_id: int, wd: date, shift: str, 
         WHERE chat_id=$2 AND tg_user_id=$3 AND work_day=$4 AND shift=$5
         """, used_min, chat_id, tg_user_id, wd, shift)
 
+
 async def fetch_export(chat_id: int, start_day: date, end_day: date):
     async with pool.acquire() as conn:
         return await conn.fetch("""
-        SELECT work_day, shift, tg_user_id, checkin_at, on_time,
+        SELECT work_day, shift, tg_user_id, tg_name, checkin_at, on_time,
                pee_count, pee_min, poop_count, poop_min,
                meal_count, meal_min, smoke_count, smoke_min
         FROM shift_summary
@@ -329,6 +378,7 @@ async def start_cmd(message: Message):
     else:
         await message.reply("请把机器人拉进群使用。", reply_markup=KB)
 
+
 @dp.message(Command("use"))
 async def use_cmd(message: Message):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -342,6 +392,7 @@ async def use_cmd(message: Message):
     await set_user_shift(message.chat.id, message.from_user.id, shift)
     await message.reply(f"✅ 当前班次已切换为：{shift}", reply_markup=KB)
 
+
 @dp.message(Command("who"))
 async def who_cmd(message: Message):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -349,6 +400,7 @@ async def who_cmd(message: Message):
     shift = await get_user_shift(message.chat.id, message.from_user.id, now_sl())
     wd = work_day(now_sl())
     await message.reply(f"当前：{shift} | 工作日：{wd}（07:00~次日07:00）", reply_markup=KB)
+
 
 @dp.message(Command("export"))
 async def export_cmd(message: Message):
@@ -374,7 +426,8 @@ async def export_cmd(message: Message):
             return await message.reply("格式：/export 2026-02-05")
         start_day = end_day = d
     elif len(parts) >= 3:
-        d1 = parse_d(parts[1]); d2 = parse_d(parts[2])
+        d1 = parse_d(parts[1])
+        d2 = parse_d(parts[2])
         if not d1 or not d2:
             return await message.reply("格式：/export 2026-02-01 2026-02-05")
         start_day, end_day = (d1, d2) if d1 <= d2 else (d2, d1)
@@ -385,23 +438,45 @@ async def export_cmd(message: Message):
 
         buf = io.StringIO()
         w = csv.writer(buf)
+
+        # ✅ 中文表头
         w.writerow([
-            "work_day(07:00~next07:00)", "shift", "tg_user_id",
-            "checkin_time", "on_time",
-            "pee_count", "pee_total_min",
-            "poop_count", "poop_total_min",
-            "meal_count", "meal_total_min",
-            "smoke_count", "smoke_total_min",
+            "工作日(07:00~次日07:00)",
+            "班次",
+            "用户ID",
+            "用户名",
+            "上班时间",
+            "是否按时",
+            "小便次数",
+            "小便总分钟",
+            "大便次数",
+            "大便总分钟",
+            "吃饭次数",
+            "吃饭总分钟",
+            "抽烟次数",
+            "抽烟总分钟",
         ])
 
         for r in rows:
             ct = r["checkin_at"]
+            # ✅ 用户ID导出为文本，避免 Excel 科学计数法
+            uid_text = "\t" + str(int(r["tg_user_id"]))
+            name_text = (r["tg_name"] or "").strip()
+
+            if ct:
+                checkin_text = ct.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+                on_time_text = "是" if r["on_time"] else "否"
+            else:
+                checkin_text = ""
+                on_time_text = "未打卡"
+
             w.writerow([
                 str(r["work_day"]),
                 r["shift"],
-                int(r["tg_user_id"]),
-                ct.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S") if ct else "",
-                "YES" if r["on_time"] else ("NO" if ct else "NO_CHECKIN"),
+                uid_text,
+                name_text,
+                checkin_text,
+                on_time_text,
                 int(r["pee_count"]), int(r["pee_min"]),
                 int(r["poop_count"]), int(r["poop_min"]),
                 int(r["meal_count"]), int(r["meal_min"]),
@@ -409,7 +484,7 @@ async def export_cmd(message: Message):
             ])
 
         data = buf.getvalue().encode("utf-8-sig")
-        filename = f"summary_{message.chat.id}_{start_day}_{end_day}.csv"
+        filename = f"打卡汇总_{message.chat.id}_{start_day}_{end_day}.csv"
         doc = BufferedInputFile(data, filename=filename)
         await message.answer_document(doc)
         await wait.edit_text("✅ 导出完成")
@@ -425,6 +500,7 @@ def normalize_text(s: str) -> str:
     s = re.sub(r"\s+", "", s)
     return s
 
+
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}) & F.text)
 async def on_group_text(message: Message):
     raw = (message.text or "").strip()
@@ -437,13 +513,14 @@ async def on_group_text(message: Message):
 
     chat_id = message.chat.id
     tg_user_id = message.from_user.id
+    tg_name = get_tg_name(message)
 
     now = now_sl()
     wd = work_day(now)
     shift = await get_user_shift(chat_id, tg_user_id, now)
 
-    # 确保汇总行存在
-    await ensure_summary_row(chat_id, tg_user_id, wd, shift)
+    # ✅ 确保汇总行存在 + 更新名字
+    await ensure_summary_row(chat_id, tg_user_id, tg_name, wd, shift)
 
     # 1) 如果有进行中，非 back 一律拦住
     active = await get_active(chat_id, tg_user_id)
@@ -453,11 +530,11 @@ async def on_group_text(message: Message):
     # 2) back：结算一次，累加总分钟 + 次数
     if kind == "back":
         if not active:
+            # ✅ 没进行中也可以删掉用户这条“回来”，看你想不想保留；这里我保守不删
             return await message.reply("你当前没有进行中的记录。", reply_markup=KB)
 
         # 取并清
         act = await clear_active(chat_id, tg_user_id)
-        start_at = act["start_at"].astimezone(TZ)
         used_min = int(max(0, (now - act["start_at"]).total_seconds() // 60))
         bk = act["kind"]
         act_wd = act["work_day"]
@@ -466,13 +543,10 @@ async def on_group_text(message: Message):
         # 删除两条提示
         for mid in [act["msg1"], act["msg2"]]:
             if mid:
-                try:
-                    await bot.delete_message(chat_id, int(mid))
-                except Exception:
-                    pass
+                await safe_delete(chat_id, int(mid))
 
         # 累加汇总
-        await ensure_summary_row(chat_id, tg_user_id, act_wd, act_shift)
+        await ensure_summary_row(chat_id, tg_user_id, tg_name, act_wd, act_shift)
         await add_break_result(chat_id, tg_user_id, act_wd, act_shift, bk, used_min)
 
         # 剩余次数提示
@@ -480,8 +554,11 @@ async def on_group_text(message: Message):
         limit = DAILY_LIMITS.get(bk, 999)
         left = max(0, limit - used_cnt)
 
+        # ✅ 删除用户触发的“回来”这条消息
+        await safe_delete(chat_id, message.message_id)
+
         return await message.reply(
-            f"✅ 已回来：本次【{KIND_CN.get(bk,bk)}】用时 {used_min} 分钟。\n"
+            f"✅ 已回来：本次【{KIND_CN.get(bk, bk)}】用时 {used_min} 分钟。\n"
             f"今日（{act_wd} {act_shift}）已用 {used_cnt}/{limit} 次，剩余 {left} 次。",
             reply_markup=KB
         )
@@ -494,6 +571,10 @@ async def on_group_text(message: Message):
 
         await add_checkin(chat_id, tg_user_id, wd, shift, now)
         ot = is_on_time(now, wd, shift)
+
+        # （可选）你要不要连“上班”触发消息也删？想删就取消下面注释
+        # await safe_delete(chat_id, message.message_id)
+
         return await message.reply(
             f"✅ 上班打卡成功（{wd} {shift}）。\n"
             f"{'✅ 按时' if ot else '⚠️ 已迟到'}（宽限 {LATE_GRACE_MIN} 分钟）",
@@ -504,7 +585,7 @@ async def on_group_text(message: Message):
     checkin_at = await get_checkin_time(chat_id, tg_user_id, wd, shift)
     if not checkin_at:
         return await message.reply(
-            f"⛔️ 你还没打上班（{wd} {shift}），不能进行【{KIND_CN.get(kind,kind)}】。\n"
+            f"⛔️ 你还没打上班（{wd} {shift}），不能进行【{KIND_CN.get(kind, kind)}】。\n"
             f"请先点【上班】。",
             reply_markup=KB
         )
@@ -514,7 +595,7 @@ async def on_group_text(message: Message):
     limit = DAILY_LIMITS.get(kind, 999)
     if used_cnt >= limit:
         return await message.reply(
-            f"⛔️ 今日（{wd} {shift}）【{KIND_CN.get(kind,kind)}】次数已满：{used_cnt}/{limit}。",
+            f"⛔️ 今日（{wd} {shift}）【{KIND_CN.get(kind, kind)}】次数已满：{used_cnt}/{limit}。",
             reply_markup=KB
         )
 
@@ -523,7 +604,7 @@ async def on_group_text(message: Message):
     deadline = (now + timedelta(minutes=minutes)).astimezone(TZ).strftime("%H:%M")
 
     msg1 = await message.reply(
-        f"📝 已记录：{KIND_CN.get(kind,kind)}（第 {used_cnt+1}/{limit} 次）",
+        f"📝 已记录：{KIND_CN.get(kind, kind)}（第 {used_cnt + 1}/{limit} 次）",
         reply_markup=KB
     )
     msg2 = await message.reply(
@@ -533,6 +614,9 @@ async def on_group_text(message: Message):
     )
 
     await set_active(chat_id, tg_user_id, wd, shift, kind, now, msg1.message_id, msg2.message_id)
+
+    # ✅ 删除用户触发的“吃饭/小便/大便/抽烟”这条消息
+    await safe_delete(chat_id, message.message_id)
 
 
 # =========================
