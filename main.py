@@ -3,6 +3,7 @@ import io
 import re
 import csv
 import asyncio
+import html
 from datetime import datetime, timedelta, date, time
 from zoneinfo import ZoneInfo
 from typing import Optional
@@ -10,7 +11,7 @@ from typing import Optional
 import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.enums import ChatType
+from aiogram.enums import ChatType, ParseMode
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.types.input_file import BufferedInputFile
 
@@ -153,9 +154,7 @@ def is_on_time(checkin_at: datetime, wd: date, shift: str) -> bool:
 
 
 def get_tg_name(message: Message) -> str:
-    """
-    导出用的“用户名字”：优先 full_name，其次 username，再次 user_id
-    """
+    """用于导出的用户名字：优先 full_name，其次 @username，再次 user_id"""
     u = message.from_user
     if not u:
         return ""
@@ -167,10 +166,16 @@ def get_tg_name(message: Message) -> str:
     return str(u.id)
 
 
+def mention_html(message: Message) -> str:
+    u = message.from_user
+    if not u:
+        return "用户"
+    title = html.escape((u.full_name or u.username or "用户"))
+    return f'<a href="tg://user?id={u.id}">{title}</a>'
+
+
 async def safe_delete(chat_id: int, message_id: int):
-    """
-    安全删除消息：没有权限/删不了就忽略
-    """
+    """安全删除：没权限/删不了就忽略"""
     try:
         await bot.delete_message(chat_id, message_id)
     except Exception:
@@ -189,7 +194,7 @@ async def db_init():
         CREATE TABLE IF NOT EXISTS shift_summary (
             chat_id BIGINT NOT NULL,
             tg_user_id BIGINT NOT NULL,
-            tg_name TEXT,                   -- ✅ 新增：记录昵称/名字
+            tg_name TEXT,
             work_day DATE NOT NULL,          -- 07:00 切日标签
             shift TEXT NOT NULL,             -- 白班/夜班
             checkin_at TIMESTAMPTZ,
@@ -208,8 +213,7 @@ async def db_init():
             PRIMARY KEY (chat_id, tg_user_id, work_day, shift)
         );
         """)
-
-        # ✅ 兼容老库：如果以前没有 tg_name 列，补上
+        # 兼容旧库：补列
         await conn.execute("ALTER TABLE shift_summary ADD COLUMN IF NOT EXISTS tg_name TEXT;")
 
         await conn.execute("""
@@ -220,11 +224,14 @@ async def db_init():
             shift TEXT NOT NULL,
             kind TEXT NOT NULL,              -- pee/poop/meal/smoke
             start_at TIMESTAMPTZ NOT NULL,
+            start_msg BIGINT,                -- ✅ 用户开始那条（吃饭/小便...）消息ID
             msg1 BIGINT,
             msg2 BIGINT,
             PRIMARY KEY (chat_id, tg_user_id)
         );
         """)
+        # 兼容旧库：补列
+        await conn.execute("ALTER TABLE active_session ADD COLUMN IF NOT EXISTS start_msg BIGINT;")
 
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS user_shift_pref (
@@ -272,19 +279,21 @@ async def get_active(chat_id: int, tg_user_id: int):
         )
 
 
-async def set_active(chat_id: int, tg_user_id: int, wd: date, shift: str, kind: str, start_at: datetime, msg1: int, msg2: int):
+async def set_active(chat_id: int, tg_user_id: int, wd: date, shift: str, kind: str,
+                     start_at: datetime, start_msg: int, msg1: int, msg2: int):
     async with pool.acquire() as conn:
         await conn.execute("""
-        INSERT INTO active_session(chat_id, tg_user_id, work_day, shift, kind, start_at, msg1, msg2)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+        INSERT INTO active_session(chat_id, tg_user_id, work_day, shift, kind, start_at, start_msg, msg1, msg2)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
         ON CONFLICT(chat_id, tg_user_id) DO UPDATE
         SET work_day=EXCLUDED.work_day,
             shift=EXCLUDED.shift,
             kind=EXCLUDED.kind,
             start_at=EXCLUDED.start_at,
+            start_msg=EXCLUDED.start_msg,
             msg1=EXCLUDED.msg1,
             msg2=EXCLUDED.msg2
-        """, chat_id, tg_user_id, wd, shift, kind, start_at, msg1, msg2)
+        """, chat_id, tg_user_id, wd, shift, kind, start_at, start_msg, msg1, msg2)
 
 
 async def clear_active(chat_id: int, tg_user_id: int):
@@ -295,9 +304,7 @@ async def clear_active(chat_id: int, tg_user_id: int):
 
 
 async def ensure_summary_row(chat_id: int, tg_user_id: int, tg_name: str, wd: date, shift: str):
-    """
-    ✅ 确保汇总行存在，并顺手更新 tg_name（昵称会变，所以每次都覆盖一下）
-    """
+    """确保汇总行存在，并更新 tg_name（昵称会变）"""
     async with pool.acquire() as conn:
         await conn.execute("""
         INSERT INTO shift_summary(chat_id, tg_user_id, tg_name, work_day, shift)
@@ -335,7 +342,6 @@ async def add_checkin(chat_id: int, tg_user_id: int, wd: date, shift: str, check
 
 
 async def add_break_result(chat_id: int, tg_user_id: int, wd: date, shift: str, kind: str, used_min: int):
-    # 累加次数+分钟
     count_col = f"{kind}_count"
     min_col = f"{kind}_min"
     async with pool.acquire() as conn:
@@ -411,7 +417,6 @@ async def export_cmd(message: Message):
         return await message.reply("你没有导出权限。")
 
     parts = (message.text or "").split()
-    # 默认导出“当前工作日”
     start_day = end_day = work_day(now_sl())
 
     def parse_d(s: str) -> Optional[date]:
@@ -439,7 +444,6 @@ async def export_cmd(message: Message):
         buf = io.StringIO()
         w = csv.writer(buf)
 
-        # ✅ 中文表头
         w.writerow([
             "工作日(07:00~次日07:00)",
             "班次",
@@ -459,8 +463,7 @@ async def export_cmd(message: Message):
 
         for r in rows:
             ct = r["checkin_at"]
-            # ✅ 用户ID导出为文本，避免 Excel 科学计数法
-            uid_text = "\t" + str(int(r["tg_user_id"]))
+            uid_text = "\t" + str(int(r["tg_user_id"]))  # 防止Excel科学计数法
             name_text = (r["tg_name"] or "").strip()
 
             if ct:
@@ -506,64 +509,74 @@ async def on_group_text(message: Message):
     raw = (message.text or "").strip()
     key = normalize_text(raw)
 
-    # 允许按钮直接用中文，不强制小写
-    kind = TEXT_ALIASES.get(raw) or TEXT_ALIASES.get(key)  # 兼容 back/in
+    kind = TEXT_ALIASES.get(raw) or TEXT_ALIASES.get(key)
     if not kind:
         return
 
     chat_id = message.chat.id
     tg_user_id = message.from_user.id
     tg_name = get_tg_name(message)
+    mention = mention_html(message)
 
     now = now_sl()
     wd = work_day(now)
     shift = await get_user_shift(chat_id, tg_user_id, now)
 
-    # ✅ 确保汇总行存在 + 更新名字
     await ensure_summary_row(chat_id, tg_user_id, tg_name, wd, shift)
 
-    # 1) 如果有进行中，非 back 一律拦住
     active = await get_active(chat_id, tg_user_id)
     if active and kind != "back":
         return await message.reply("⚠️ 你当前还有进行中的状态，请先点【回来】再继续。", reply_markup=KB)
 
-    # 2) back：结算一次，累加总分钟 + 次数
+    # 2) back：结算一次（删过程消息，只留结算一条）
     if kind == "back":
         if not active:
-            # ✅ 没进行中也可以删掉用户这条“回来”，看你想不想保留；这里我保守不删
             return await message.reply("你当前没有进行中的记录。", reply_markup=KB)
 
-        # 取并清
         act = await clear_active(chat_id, tg_user_id)
         used_min = int(max(0, (now - act["start_at"]).total_seconds() // 60))
         bk = act["kind"]
         act_wd = act["work_day"]
         act_shift = act["shift"]
 
-        # 删除两条提示
-        for mid in [act["msg1"], act["msg2"]]:
-            if mid:
-                await safe_delete(chat_id, int(mid))
+        # 计算是否超时（按提示值）
+        limit_min = DEFAULT_MINUTES.get(bk, 0)
+        overtime = max(0, used_min - limit_min) if limit_min else 0
 
         # 累加汇总
         await ensure_summary_row(chat_id, tg_user_id, tg_name, act_wd, act_shift)
         await add_break_result(chat_id, tg_user_id, act_wd, act_shift, bk, used_min)
 
-        # 剩余次数提示
         used_cnt = await get_kind_count(chat_id, tg_user_id, act_wd, act_shift, bk)
         limit = DAILY_LIMITS.get(bk, 999)
         left = max(0, limit - used_cnt)
 
-        # ✅ 删除用户触发的“回来”这条消息
-        await safe_delete(chat_id, message.message_id)
+        # ✅ 删除过程消息：用户开始那条 + 机器人两条提示 + 用户“回来”这条
+        to_delete = []
+        if act.get("start_msg"):
+            to_delete.append(int(act["start_msg"]))
+        if act.get("msg1"):
+            to_delete.append(int(act["msg1"]))
+        if act.get("msg2"):
+            to_delete.append(int(act["msg2"]))
+        to_delete.append(int(message.message_id))  # 用户回来
 
-        return await message.reply(
-            f"✅ 已回来：本次【{KIND_CN.get(bk, bk)}】用时 {used_min} 分钟。\n"
+        for mid in to_delete:
+            await safe_delete(chat_id, mid)
+
+        extra = ""
+        if limit_min:
+            extra = f"\n⏱ 超时：{overtime} 分钟（提示 {limit_min} 分钟）" if overtime > 0 else f"\n✅ 未超时（提示 {limit_min} 分钟）"
+
+        return await message.answer(
+            f"✅ {mention} 已回来：本次【{KIND_CN.get(bk, bk)}】用时 {used_min} 分钟。"
+            f"{extra}\n"
             f"今日（{act_wd} {act_shift}）已用 {used_cnt}/{limit} 次，剩余 {left} 次。",
-            reply_markup=KB
+            reply_markup=KB,
+            parse_mode=ParseMode.HTML
         )
 
-    # 3) checkin：上班（允许在任何时间打，但会判定是否按时；同一班次只允许一次）
+    # 3) checkin：上班
     if kind == "checkin":
         exist = await get_checkin_time(chat_id, tg_user_id, wd, shift)
         if exist:
@@ -571,14 +584,11 @@ async def on_group_text(message: Message):
 
         await add_checkin(chat_id, tg_user_id, wd, shift, now)
         ot = is_on_time(now, wd, shift)
-
-        # （可选）你要不要连“上班”触发消息也删？想删就取消下面注释
-        # await safe_delete(chat_id, message.message_id)
-
-        return await message.reply(
-            f"✅ 上班打卡成功（{wd} {shift}）。\n"
+        return await message.answer(
+            f"✅ {mention} 上班打卡成功（{wd} {shift}）。\n"
             f"{'✅ 按时' if ot else '⚠️ 已迟到'}（宽限 {LATE_GRACE_MIN} 分钟）",
-            reply_markup=KB
+            reply_markup=KB,
+            parse_mode=ParseMode.HTML
         )
 
     # 4) 其它类型：没上班不能开始
@@ -599,24 +609,28 @@ async def on_group_text(message: Message):
             reply_markup=KB
         )
 
-    # 6) 开始一次：记录 active，并提示“几点前回来”
+    # 6) 开始一次：不删消息，等回来统一删
     minutes = DEFAULT_MINUTES.get(kind, 10)
     deadline = (now + timedelta(minutes=minutes)).astimezone(TZ).strftime("%H:%M")
 
-    msg1 = await message.reply(
-        f"📝 已记录：{KIND_CN.get(kind, kind)}（第 {used_cnt + 1}/{limit} 次）",
-        reply_markup=KB
+    msg1 = await message.answer(
+        f"📝 {mention} 已记录：{KIND_CN.get(kind, kind)}（第 {used_cnt + 1}/{limit} 次）",
+        reply_markup=KB,
+        parse_mode=ParseMode.HTML
     )
-    msg2 = await message.reply(
-        f"⏰ 请在 {deadline} 前回来（提示值 {minutes} 分钟）。\n"
+    msg2 = await message.answer(
+        f"⏰ {mention} 请在 {deadline} 前回来（提示值 {minutes} 分钟）。\n"
         f"回来请点【回来】或发：回 / back / 1 / 结束",
-        reply_markup=KB
+        reply_markup=KB,
+        parse_mode=ParseMode.HTML
     )
 
-    await set_active(chat_id, tg_user_id, wd, shift, kind, now, msg1.message_id, msg2.message_id)
-
-    # ✅ 删除用户触发的“吃饭/小便/大便/抽烟”这条消息
-    await safe_delete(chat_id, message.message_id)
+    await set_active(
+        chat_id, tg_user_id, wd, shift, kind, now,
+        message.message_id,  # ✅ 记录用户开始那条
+        msg1.message_id,
+        msg2.message_id
+    )
 
 
 # =========================
@@ -624,7 +638,6 @@ async def on_group_text(message: Message):
 # =========================
 async def main():
     await db_init()
-    # 避免 webhook 残留导致“没反应”
     await bot.delete_webhook(drop_pending_updates=True)
     print("[bot] polling started")
     await dp.start_polling(bot)
