@@ -33,9 +33,9 @@ TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
 
 def parse_admin_ids(raw: str) -> set[int]:
+    out: set[int] = set()
     if not raw:
-        return set()
-    out = set()
+        return out
     for x in raw.split(","):
         x = x.strip()
         if x.isdigit():
@@ -51,7 +51,7 @@ pool: asyncpg.Pool | None = None
 
 
 # =========================
-# 规则（按自然日）
+# 规则（按越南自然日）
 # =========================
 DAILY_LIMITS = {
     "pee": 3,
@@ -76,58 +76,54 @@ KIND_CN = {
     "smoke": "抽烟",
 }
 
+# ✅ 重要：全部用 /命令，确保隐私模式也能收到
+CMD_ALIASES = {
+    "/in": "checkin",
+    "/out": "checkout",
+    "/meal": "meal",
+    "/pee": "pee",
+    "/poop": "poop",
+    "/smoke": "smoke",
+    "/back": "back",
+    "/export": "export",
+}
+
+# 也支持中文/英文纯文本（如果隐私模式开着可能收不到，但不影响 /命令）
 TEXT_ALIASES = {
-    # 上下班
     "上班": "checkin",
-    "开工": "checkin",
-    "in": "checkin",
-
     "下班": "checkout",
-    "收工": "checkout",
-    "out": "checkout",
-
-    # 休息
+    "吃饭": "meal",
     "小便": "pee",
     "厕所": "pee",
-    "上厕所": "pee",
-    "尿": "pee",
-
     "大便": "poop",
-    "拉屎": "poop",
-
-    "吃饭": "meal",
-    "eat": "meal",
-
     "抽烟": "smoke",
-    "抽": "smoke",
-
-    # 回来结算
     "回来": "back",
     "回": "back",
     "back": "back",
-    "1": "back",
-    "结束": "back",
+    "导出": "export",
 }
 
+
+# ✅ 键盘：全部是 /命令（点了必触发）
 KB = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="上班"), KeyboardButton(text="下班")],
-        [KeyboardButton(text="吃饭"), KeyboardButton(text="小便"), KeyboardButton(text="大便")],
-        [KeyboardButton(text="抽烟"), KeyboardButton(text="回来")],
+        [KeyboardButton(text="/in"), KeyboardButton(text="/out")],
+        [KeyboardButton(text="/meal"), KeyboardButton(text="/pee"), KeyboardButton(text="/poop")],
+        [KeyboardButton(text="/smoke"), KeyboardButton(text="/back")],
+        [KeyboardButton(text="/export")],
     ],
     resize_keyboard=True
 )
 
 
 # =========================
-# 时间口径：越南自然日（00:00~23:59）
+# 时间：越南自然日
 # =========================
 def now_vn() -> datetime:
     return datetime.now(tz=TZ)
 
 
-def work_day(dt: datetime) -> date:
-    # ✅ 自然日，不切 07:00
+def day_vn(dt: datetime) -> date:
     return dt.astimezone(TZ).date()
 
 
@@ -158,23 +154,26 @@ async def safe_delete(chat_id: int, message_id: int):
         pass
 
 
-def normalize_text(s: str) -> str:
-    s = (s or "").strip().lower()
+def norm(s: str) -> str:
+    s = (s or "").strip()
     s = re.sub(r"\s+", "", s)
     return s
 
 
 # =========================
-# DB 初始化（汇总表 + 活动状态）
+# DB：用新表名，避免旧库冲突
 # =========================
+TABLE_SUM = "shift_summary_vn_v2"
+TABLE_ACT = "active_session_vn_v2"
+
+
 async def db_init():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
 
     async with pool.acquire() as conn:
-        # ✅ 每人每天一行（自然日）
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS shift_summary (
+        await conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {TABLE_SUM} (
             chat_id BIGINT NOT NULL,
             tg_user_id BIGINT NOT NULL,
             tg_name TEXT,
@@ -196,22 +195,21 @@ async def db_init():
         );
         """)
 
-        # ✅ 进行中的休息状态（一个人同一时间只能一个）
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS active_session (
+        await conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {TABLE_ACT} (
             chat_id BIGINT NOT NULL,
             tg_user_id BIGINT NOT NULL,
             work_day DATE NOT NULL,
             kind TEXT NOT NULL,              -- pee/poop/meal/smoke
             start_at TIMESTAMPTZ NOT NULL,
-            start_msg BIGINT,                -- 用户开始那条消息ID
-            msg1 BIGINT,                     -- 机器人提示1
-            msg2 BIGINT,                     -- 机器人提示2
+            start_msg BIGINT,
+            msg1 BIGINT,
+            msg2 BIGINT,
             PRIMARY KEY (chat_id, tg_user_id)
         );
         """)
 
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_sum_day ON shift_summary(chat_id, work_day);")
+        await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_sum_day_v2 ON {TABLE_SUM}(chat_id, work_day);")
 
 
 # =========================
@@ -219,66 +217,65 @@ async def db_init():
 # =========================
 async def ensure_summary_row(chat_id: int, tg_user_id: int, tg_name: str, wd: date):
     async with pool.acquire() as conn:
-        await conn.execute("""
-        INSERT INTO shift_summary(chat_id, tg_user_id, tg_name, work_day)
+        await conn.execute(f"""
+        INSERT INTO {TABLE_SUM}(chat_id, tg_user_id, tg_name, work_day)
         VALUES($1,$2,$3,$4)
         ON CONFLICT(chat_id, tg_user_id, work_day)
         DO UPDATE SET tg_name=EXCLUDED.tg_name, updated_at=NOW()
         """, chat_id, tg_user_id, tg_name, wd)
 
 
-async def get_checkin_time(chat_id: int, tg_user_id: int, wd: date) -> Optional[datetime]:
+async def get_checkin(chat_id: int, tg_user_id: int, wd: date) -> Optional[datetime]:
     async with pool.acquire() as conn:
-        return await conn.fetchval("""
-        SELECT checkin_at FROM shift_summary
-        WHERE chat_id=$1 AND tg_user_id=$2 AND work_day=$3
-        """, chat_id, tg_user_id, wd)
+        return await conn.fetchval(
+            f"SELECT checkin_at FROM {TABLE_SUM} WHERE chat_id=$1 AND tg_user_id=$2 AND work_day=$3",
+            chat_id, tg_user_id, wd
+        )
 
 
-async def get_checkout_time(chat_id: int, tg_user_id: int, wd: date) -> Optional[datetime]:
+async def get_checkout(chat_id: int, tg_user_id: int, wd: date) -> Optional[datetime]:
     async with pool.acquire() as conn:
-        return await conn.fetchval("""
-        SELECT checkout_at FROM shift_summary
-        WHERE chat_id=$1 AND tg_user_id=$2 AND work_day=$3
-        """, chat_id, tg_user_id, wd)
+        return await conn.fetchval(
+            f"SELECT checkout_at FROM {TABLE_SUM} WHERE chat_id=$1 AND tg_user_id=$2 AND work_day=$3",
+            chat_id, tg_user_id, wd
+        )
 
 
-async def set_checkin(chat_id: int, tg_user_id: int, wd: date, checkin_at: datetime):
+async def set_checkin(chat_id: int, tg_user_id: int, wd: date, t: datetime):
     async with pool.acquire() as conn:
-        await conn.execute("""
-        UPDATE shift_summary
-        SET checkin_at=$1, updated_at=NOW()
-        WHERE chat_id=$2 AND tg_user_id=$3 AND work_day=$4
-        """, checkin_at, chat_id, tg_user_id, wd)
+        await conn.execute(
+            f"UPDATE {TABLE_SUM} SET checkin_at=$1, updated_at=NOW() WHERE chat_id=$2 AND tg_user_id=$3 AND work_day=$4",
+            t, chat_id, tg_user_id, wd
+        )
 
 
-async def set_checkout(chat_id: int, tg_user_id: int, wd: date, checkout_at: datetime):
+async def set_checkout(chat_id: int, tg_user_id: int, wd: date, t: datetime):
     async with pool.acquire() as conn:
-        await conn.execute("""
-        UPDATE shift_summary
-        SET checkout_at=$1, updated_at=NOW()
-        WHERE chat_id=$2 AND tg_user_id=$3 AND work_day=$4
-        """, checkout_at, chat_id, tg_user_id, wd)
+        await conn.execute(
+            f"UPDATE {TABLE_SUM} SET checkout_at=$1, updated_at=NOW() WHERE chat_id=$2 AND tg_user_id=$3 AND work_day=$4",
+            t, chat_id, tg_user_id, wd
+        )
 
 
 async def get_kind_count(chat_id: int, tg_user_id: int, wd: date, kind: str) -> int:
     col = f"{kind}_count"
     async with pool.acquire() as conn:
-        return int(await conn.fetchval(f"""
-        SELECT {col} FROM shift_summary
-        WHERE chat_id=$1 AND tg_user_id=$2 AND work_day=$3
-        """, chat_id, tg_user_id, wd) or 0)
+        v = await conn.fetchval(
+            f"SELECT {col} FROM {TABLE_SUM} WHERE chat_id=$1 AND tg_user_id=$2 AND work_day=$3",
+            chat_id, tg_user_id, wd
+        )
+    return int(v or 0)
 
 
-async def add_break_result(chat_id: int, tg_user_id: int, wd: date, kind: str, used_min: int):
+async def add_break(chat_id: int, tg_user_id: int, wd: date, kind: str, used_min: int):
     count_col = f"{kind}_count"
     min_col = f"{kind}_min"
     async with pool.acquire() as conn:
         await conn.execute(f"""
-        UPDATE shift_summary
+        UPDATE {TABLE_SUM}
         SET {count_col} = {count_col} + 1,
             {min_col}   = {min_col} + $1,
-            updated_at = NOW()
+            updated_at  = NOW()
         WHERE chat_id=$2 AND tg_user_id=$3 AND work_day=$4
         """, used_min, chat_id, tg_user_id, wd)
 
@@ -286,7 +283,7 @@ async def add_break_result(chat_id: int, tg_user_id: int, wd: date, kind: str, u
 async def get_active(chat_id: int, tg_user_id: int):
     async with pool.acquire() as conn:
         return await conn.fetchrow(
-            "SELECT * FROM active_session WHERE chat_id=$1 AND tg_user_id=$2",
+            f"SELECT * FROM {TABLE_ACT} WHERE chat_id=$1 AND tg_user_id=$2",
             chat_id, tg_user_id
         )
 
@@ -294,8 +291,8 @@ async def get_active(chat_id: int, tg_user_id: int):
 async def set_active(chat_id: int, tg_user_id: int, wd: date, kind: str,
                      start_at: datetime, start_msg: int, msg1: int, msg2: int):
     async with pool.acquire() as conn:
-        await conn.execute("""
-        INSERT INTO active_session(chat_id, tg_user_id, work_day, kind, start_at, start_msg, msg1, msg2)
+        await conn.execute(f"""
+        INSERT INTO {TABLE_ACT}(chat_id, tg_user_id, work_day, kind, start_at, start_msg, msg1, msg2)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8)
         ON CONFLICT(chat_id, tg_user_id) DO UPDATE
         SET work_day=EXCLUDED.work_day,
@@ -310,39 +307,41 @@ async def set_active(chat_id: int, tg_user_id: int, wd: date, kind: str,
 async def clear_active(chat_id: int, tg_user_id: int):
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM active_session WHERE chat_id=$1 AND tg_user_id=$2",
+            f"SELECT * FROM {TABLE_ACT} WHERE chat_id=$1 AND tg_user_id=$2",
             chat_id, tg_user_id
         )
-        await conn.execute("DELETE FROM active_session WHERE chat_id=$1 AND tg_user_id=$2", chat_id, tg_user_id)
+        await conn.execute(
+            f"DELETE FROM {TABLE_ACT} WHERE chat_id=$1 AND tg_user_id=$2",
+            chat_id, tg_user_id
+        )
         return row
 
 
 async def fetch_export(chat_id: int, start_day: date, end_day: date):
     async with pool.acquire() as conn:
-        return await conn.fetch("""
+        return await conn.fetch(f"""
         SELECT work_day, tg_user_id, tg_name, checkin_at, checkout_at,
                pee_count, pee_min, poop_count, poop_min,
                meal_count, meal_min, smoke_count, smoke_min
-        FROM shift_summary
+        FROM {TABLE_SUM}
         WHERE chat_id=$1 AND work_day BETWEEN $2 AND $3
         ORDER BY work_day ASC, tg_user_id ASC
         """, chat_id, start_day, end_day)
 
 
 # =========================
-# 指令：/start /export
+# /start + /export 指令
 # =========================
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
     if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         await message.reply(
             "✅ 打卡机器人已启用（越南时间 UTC+7）\n\n"
-            "按钮：上班 / 下班 / 吃饭 / 小便 / 大便 / 抽烟 / 回来\n"
-            "规则：不限制什么时候打卡；未上班不能休息；下班后不能再开始休息；进行中必须先回来。\n"
-            "统计口径：越南自然日 00:00~23:59。\n\n"
-            "导出（仅管理员）：\n"
-            "/export 2026-02-05\n"
-            "/export 2026-02-01 2026-02-05",
+            "请用按钮（推荐）或命令：\n"
+            "/in 上班  |  /out 下班\n"
+            "/meal 吃饭 | /pee 小便 | /poop 大便 | /smoke 抽烟\n"
+            "/back 回来（结束本次休息并结算）\n\n"
+            "导出（仅管理员）：/export 2026-02-07 或 /export 2026-02-01 2026-02-07\n",
             reply_markup=KB
         )
     else:
@@ -354,14 +353,15 @@ async def export_cmd(message: Message):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return await message.reply("请在群里导出。")
 
-    # ✅ 只允许管理员导出（你要的）
+    # ✅ 只允许管理员导出
     if not ADMIN_IDS:
-        return await message.reply("未配置 ADMIN_IDS，当前禁止导出。请在环境变量设置 ADMIN_IDS=xxx,yyy")
+        return await message.reply("未配置 ADMIN_IDS，当前禁止导出。请设置 ADMIN_IDS=xxx,yyy")
     if message.from_user.id not in ADMIN_IDS:
         return await message.reply("你没有导出权限。")
 
     parts = (message.text or "").split()
-    start_day = end_day = work_day(now_vn())
+    today = day_vn(now_vn())
+    start_day = end_day = today
 
     def parse_d(s: str) -> Optional[date]:
         try:
@@ -372,13 +372,13 @@ async def export_cmd(message: Message):
     if len(parts) == 2:
         d = parse_d(parts[1])
         if not d:
-            return await message.reply("格式：/export 2026-02-05")
+            return await message.reply("格式：/export 2026-02-07")
         start_day = end_day = d
     elif len(parts) >= 3:
         d1 = parse_d(parts[1])
         d2 = parse_d(parts[2])
         if not d1 or not d2:
-            return await message.reply("格式：/export 2026-02-01 2026-02-05")
+            return await message.reply("格式：/export 2026-02-01 2026-02-07")
         start_day, end_day = (d1, d2) if d1 <= d2 else (d2, d1)
 
     wait = await message.reply("⏳ 正在导出请稍等…")
@@ -422,22 +422,27 @@ async def export_cmd(message: Message):
 
         data = buf.getvalue().encode("utf-8-sig")
         filename = f"打卡汇总_{message.chat.id}_{start_day}_{end_day}.csv"
-        doc = BufferedInputFile(data, filename=filename)
-        await message.answer_document(doc)
+        await message.answer_document(BufferedInputFile(data, filename=filename))
         await wait.edit_text("✅ 导出完成")
     except Exception as e:
         await wait.edit_text(f"❌ 导出失败：{type(e).__name__}: {e}")
 
 
 # =========================
-# 群消息：打卡入口
+# 统一处理入口（只要群里发消息）
 # =========================
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}) & F.text)
 async def on_group_text(message: Message):
-    raw = (message.text or "").strip()
-    key = normalize_text(raw)
+    raw = norm(message.text or "")
+    raw_lower = raw.lower()
 
-    kind = TEXT_ALIASES.get(raw) or TEXT_ALIASES.get(key)
+    # 1) 优先识别 /命令（隐私模式也能收到）
+    kind = CMD_ALIASES.get(raw_lower)
+
+    # 2) 其次识别普通文字（隐私模式开着可能收不到，但不影响）
+    if not kind:
+        kind = TEXT_ALIASES.get(raw) or TEXT_ALIASES.get(raw_lower)
+
     if not kind:
         return
 
@@ -447,17 +452,22 @@ async def on_group_text(message: Message):
     mention = mention_html(message)
 
     now = now_vn()
-    wd = work_day(now)
+    wd = day_vn(now)
+
+    # 导出：直接走 /export（只有管理员能出）
+    if kind == "export":
+        message.text = "/export"
+        return await export_cmd(message)
 
     await ensure_summary_row(chat_id, tg_user_id, tg_name, wd)
 
     active = await get_active(chat_id, tg_user_id)
 
-    # 如果有进行中的休息，除了 back 之外一律禁止
+    # 有进行中的休息：除 /back 外都拦住
     if active and kind != "back":
-        return await message.reply("⚠️ 你当前还有进行中的状态，请先点【回来】再继续。", reply_markup=KB)
+        return await message.reply("⚠️ 你当前还有进行中的状态，请先点【/back】再继续。", reply_markup=KB)
 
-    # 1) 回来：结算一次休息，并删除过程消息
+    # /back：结束休息并结算
     if kind == "back":
         if not active:
             return await message.reply("你当前没有进行中的记录。", reply_markup=KB)
@@ -465,17 +475,16 @@ async def on_group_text(message: Message):
         act = await clear_active(chat_id, tg_user_id)
         used_min = int(max(0, (now - act["start_at"]).total_seconds() // 60))
         bk = act["kind"]
-        act_wd = act["work_day"]
+        act_day = act["work_day"]
 
-        # 累加汇总
-        await ensure_summary_row(chat_id, tg_user_id, tg_name, act_wd)
-        await add_break_result(chat_id, tg_user_id, act_wd, bk, used_min)
+        await ensure_summary_row(chat_id, tg_user_id, tg_name, act_day)
+        await add_break(chat_id, tg_user_id, act_day, bk, used_min)
 
-        used_cnt = await get_kind_count(chat_id, tg_user_id, act_wd, bk)
+        used_cnt = await get_kind_count(chat_id, tg_user_id, act_day, bk)
         limit = DAILY_LIMITS.get(bk, 999)
         left = max(0, limit - used_cnt)
 
-        # 删除过程消息：开始那条 + 机器人两条 + 用户回来这条
+        # 删除过程消息（可删就删，删不了不影响）
         to_delete = []
         if act.get("start_msg"):
             to_delete.append(int(act["start_msg"]))
@@ -484,7 +493,6 @@ async def on_group_text(message: Message):
         if act.get("msg2"):
             to_delete.append(int(act["msg2"]))
         to_delete.append(int(message.message_id))
-
         for mid in to_delete:
             await safe_delete(chat_id, mid)
 
@@ -497,14 +505,14 @@ async def on_group_text(message: Message):
         return await message.answer(
             f"✅ {mention} 已回来：本次【{KIND_CN.get(bk, bk)}】用时 {used_min} 分钟。"
             f"{extra}\n"
-            f"今日（{act_wd}）已用 {used_cnt}/{limit} 次，剩余 {left} 次。",
+            f"今日（{act_day}）已用 {used_cnt}/{limit} 次，剩余 {left} 次。",
             reply_markup=KB,
             parse_mode=ParseMode.HTML
         )
 
-    # 2) 上班：不限制时间
+    # /in：上班（不限制时间）
     if kind == "checkin":
-        exist = await get_checkin_time(chat_id, tg_user_id, wd)
+        exist = await get_checkin(chat_id, tg_user_id, wd)
         if exist:
             return await message.reply("⛔️ 今天已经打过上班了。", reply_markup=KB)
 
@@ -515,42 +523,35 @@ async def on_group_text(message: Message):
             parse_mode=ParseMode.HTML
         )
 
-    # 3) 下班：不限制时间，但要求先上班 + 不能重复下班
+    # /out：下班（不限制时间，但必须先上班）
     if kind == "checkout":
-        checkin_at = await get_checkin_time(chat_id, tg_user_id, wd)
-        if not checkin_at:
-            return await message.reply("⛔️ 你今天还没打上班，不能下班。", reply_markup=KB)
+        ci = await get_checkin(chat_id, tg_user_id, wd)
+        if not ci:
+            return await message.reply("⛔️ 你今天还没上班，不能下班。请先点 /in", reply_markup=KB)
 
-        checkout_at = await get_checkout_time(chat_id, tg_user_id, wd)
-        if checkout_at:
+        co = await get_checkout(chat_id, tg_user_id, wd)
+        if co:
             return await message.reply("⛔️ 今天已经打过下班了。", reply_markup=KB)
 
-        # 这里 active 已经在上面拦截了（有休息进行中必须先回来）
         await set_checkout(chat_id, tg_user_id, wd, now)
-        used_min = int(max(0, (now - checkin_at).total_seconds() // 60))
+        used_min = int(max(0, (now - ci).total_seconds() // 60))
         return await message.answer(
             f"✅ {mention} 下班打卡成功（越南时间）：{now.astimezone(TZ).strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"⏱ 今日在岗时长（从上班到下班）：{used_min} 分钟（{used_min/60:.2f} 小时）",
+            f"⏱ 今日在岗时长（上班→下班）：{used_min} 分钟（{used_min/60:.2f} 小时）",
             reply_markup=KB,
             parse_mode=ParseMode.HTML
         )
 
-    # 4) 其它休息类型：必须先上班 + 不能下班后再开始
-    checkin_at = await get_checkin_time(chat_id, tg_user_id, wd)
-    if not checkin_at:
-        return await message.reply(
-            f"⛔️ 你还没打上班（{wd}），不能进行【{KIND_CN.get(kind, kind)}】。\n请先点【上班】。",
-            reply_markup=KB
-        )
+    # 休息：必须先上班，且不能下班后再开始
+    ci = await get_checkin(chat_id, tg_user_id, wd)
+    if not ci:
+        return await message.reply("⛔️ 你今天还没上班，不能休息。请先点 /in", reply_markup=KB)
 
-    checkout_at = await get_checkout_time(chat_id, tg_user_id, wd)
-    if checkout_at:
-        return await message.reply(
-            f"⛔️ 你今天已经下班（{wd}），不能再开始【{KIND_CN.get(kind, kind)}】。",
-            reply_markup=KB
-        )
+    co = await get_checkout(chat_id, tg_user_id, wd)
+    if co:
+        return await message.reply("⛔️ 你今天已经下班，不能再开始休息。", reply_markup=KB)
 
-    # 5) 次数限制
+    # 次数限制
     used_cnt = await get_kind_count(chat_id, tg_user_id, wd, kind)
     limit = DAILY_LIMITS.get(kind, 999)
     if used_cnt >= limit:
@@ -559,7 +560,7 @@ async def on_group_text(message: Message):
             reply_markup=KB
         )
 
-    # 6) 开始一次休息：等回来统一删消息
+    # 开始休息：发两条提示，等 /back 结算并删消息
     minutes = DEFAULT_MINUTES.get(kind, 10)
     deadline = (now + timedelta(minutes=minutes)).astimezone(TZ).strftime("%H:%M")
 
@@ -570,7 +571,7 @@ async def on_group_text(message: Message):
     )
     msg2 = await message.answer(
         f"⏰ {mention} 请在 {deadline} 前回来（提示值 {minutes} 分钟）。\n"
-        f"回来请点【回来】或发：回 / back / 1 / 结束",
+        f"结束请点【/back】",
         reply_markup=KB,
         parse_mode=ParseMode.HTML
     )
