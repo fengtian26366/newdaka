@@ -4,7 +4,8 @@ import re
 import csv
 import asyncio
 import html
-from datetime import datetime, timedelta, date, time
+import random
+from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from typing import Optional
 
@@ -76,6 +77,24 @@ KIND_CN = {
     "smoke": "抽烟",
 }
 
+# ✅ 上班鼓励语
+CHECKIN_QUOTES = [
+    "💪 开工！今天也要稳稳拿下。",
+    "🔥 状态拉满，冲就完事了！",
+    "✅ 打卡成功，保持节奏，慢慢赢。",
+    "🚀 新的一班开始，专注就会有结果。",
+    "🌟 加油！你今天一定很顺。",
+    "🧠 先把最重要的事搞定，后面就轻松了。",
+]
+
+# ✅ 下班鼓励语（可选）
+CHECKOUT_QUOTES = [
+    "👏 辛苦了！收工休息一下。",
+    "✅ 下班啦，今天表现不错。",
+    "🌙 结束一天，早点放松。",
+    "💯 做得好，明天继续保持。",
+]
+
 # ✅ 重要：全部用 /命令，确保隐私模式也能收到
 CMD_ALIASES = {
     "/in": "checkin",
@@ -104,13 +123,13 @@ TEXT_ALIASES = {
 }
 
 
-# ✅ 键盘：全部是 /命令（点了必触发）
+# ✅ 键盘：中文显示（但仍然用 /命令触发）
 KB = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="/in"), KeyboardButton(text="/out")],
-        [KeyboardButton(text="/meal"), KeyboardButton(text="/pee"), KeyboardButton(text="/poop")],
-        [KeyboardButton(text="/smoke"), KeyboardButton(text="/back")],
-        [KeyboardButton(text="/export")],
+        [KeyboardButton(text="✅ /in 上班"), KeyboardButton(text="🏁 /out 下班")],
+        [KeyboardButton(text="🍚 /meal 吃饭"), KeyboardButton(text="🚽 /pee 小便"), KeyboardButton(text="💩 /poop 大便")],
+        [KeyboardButton(text="🚬 /smoke 抽烟"), KeyboardButton(text="↩️ /back 回来")],
+        [KeyboardButton(text="📤 /export 导出")],
     ],
     resize_keyboard=True
 )
@@ -152,12 +171,6 @@ async def safe_delete(chat_id: int, message_id: int):
         await bot.delete_message(chat_id, message_id)
     except Exception:
         pass
-
-
-def norm(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"\s+", "", s)
-    return s
 
 
 # =========================
@@ -337,7 +350,7 @@ async def start_cmd(message: Message):
     if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         await message.reply(
             "✅ 打卡机器人已启用（越南时间 UTC+7）\n\n"
-            "请用按钮（推荐）或命令：\n"
+            "请用下方按钮（推荐）或命令：\n"
             "/in 上班  |  /out 下班\n"
             "/meal 吃饭 | /pee 小便 | /poop 大便 | /smoke 抽烟\n"
             "/back 回来（结束本次休息并结算）\n\n"
@@ -429,17 +442,21 @@ async def export_cmd(message: Message):
 
 
 # =========================
-# 统一处理入口（只要群里发消息）
+# 统一处理入口（群消息）
 # =========================
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}) & F.text)
 async def on_group_text(message: Message):
-    raw = norm(message.text or "")
+    raw = (message.text or "").strip()
     raw_lower = raw.lower()
 
-    # 1) 优先识别 /命令（隐私模式也能收到）
-    kind = CMD_ALIASES.get(raw_lower)
+    # ✅ 从文本里抓到第一个 /xxx 命令（适配“✅ /in 上班”这种按钮文本）
+    m = re.search(r"/[a-z]+", raw_lower)
+    cmd = m.group(0) if m else raw_lower.split()[0]
 
-    # 2) 其次识别普通文字（隐私模式开着可能收不到，但不影响）
+    # 1) 优先命令
+    kind = CMD_ALIASES.get(cmd)
+
+    # 2) 其次普通文字
     if not kind:
         kind = TEXT_ALIASES.get(raw) or TEXT_ALIASES.get(raw_lower)
 
@@ -454,7 +471,7 @@ async def on_group_text(message: Message):
     now = now_vn()
     wd = day_vn(now)
 
-    # 导出：直接走 /export（只有管理员能出）
+    # 导出按钮：等同 /export
     if kind == "export":
         message.text = "/export"
         return await export_cmd(message)
@@ -463,11 +480,11 @@ async def on_group_text(message: Message):
 
     active = await get_active(chat_id, tg_user_id)
 
-    # 有进行中的休息：除 /back 外都拦住
+    # 有进行中的休息：除 back 外都拦住
     if active and kind != "back":
-        return await message.reply("⚠️ 你当前还有进行中的状态，请先点【/back】再继续。", reply_markup=KB)
+        return await message.reply("⚠️ 你当前还有进行中的状态，请先点【/back 回来】再继续。", reply_markup=KB)
 
-    # /back：结束休息并结算
+    # back：结束休息并结算
     if kind == "back":
         if not active:
             return await message.reply("你当前没有进行中的记录。", reply_markup=KB)
@@ -484,7 +501,7 @@ async def on_group_text(message: Message):
         limit = DAILY_LIMITS.get(bk, 999)
         left = max(0, limit - used_cnt)
 
-        # 删除过程消息（可删就删，删不了不影响）
+        # 删除过程消息（可删就删）
         to_delete = []
         if act.get("start_msg"):
             to_delete.append(int(act["start_msg"]))
@@ -510,20 +527,23 @@ async def on_group_text(message: Message):
             parse_mode=ParseMode.HTML
         )
 
-    # /in：上班（不限制时间）
+    # in：上班（不限制时间）
     if kind == "checkin":
         exist = await get_checkin(chat_id, tg_user_id, wd)
         if exist:
             return await message.reply("⛔️ 今天已经打过上班了。", reply_markup=KB)
 
         await set_checkin(chat_id, tg_user_id, wd, now)
+        quote = random.choice(CHECKIN_QUOTES)
+
         return await message.answer(
-            f"✅ {mention} 上班打卡成功（越南时间）：{now.astimezone(TZ).strftime('%Y-%m-%d %H:%M:%S')}",
+            f"✅ {mention} 上班打卡成功（越南时间）：{now.astimezone(TZ).strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"{quote}",
             reply_markup=KB,
             parse_mode=ParseMode.HTML
         )
 
-    # /out：下班（不限制时间，但必须先上班）
+    # out：下班（不限制时间，但必须先上班）
     if kind == "checkout":
         ci = await get_checkin(chat_id, tg_user_id, wd)
         if not ci:
@@ -535,9 +555,12 @@ async def on_group_text(message: Message):
 
         await set_checkout(chat_id, tg_user_id, wd, now)
         used_min = int(max(0, (now - ci).total_seconds() // 60))
+        quote = random.choice(CHECKOUT_QUOTES)
+
         return await message.answer(
             f"✅ {mention} 下班打卡成功（越南时间）：{now.astimezone(TZ).strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"⏱ 今日在岗时长（上班→下班）：{used_min} 分钟（{used_min/60:.2f} 小时）",
+            f"⏱ 今日在岗时长（上班→下班）：{used_min} 分钟（{used_min/60:.2f} 小时）\n"
+            f"{quote}",
             reply_markup=KB,
             parse_mode=ParseMode.HTML
         )
@@ -571,7 +594,7 @@ async def on_group_text(message: Message):
     )
     msg2 = await message.answer(
         f"⏰ {mention} 请在 {deadline} 前回来（提示值 {minutes} 分钟）。\n"
-        f"结束请点【/back】",
+        f"结束请点【/back 回来】",
         reply_markup=KB,
         parse_mode=ParseMode.HTML
     )
