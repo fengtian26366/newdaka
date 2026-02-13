@@ -7,7 +7,7 @@ import html
 import random
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
-from typing import Optional
+from typing import Optional, Tuple
 
 import asyncpg
 from aiogram import Bot, Dispatcher, F
@@ -29,7 +29,7 @@ if not BOT_TOKEN:
 if not DATABASE_URL:
     raise RuntimeError("Missing DATABASE_URL")
 
-# ✅ 斯里兰卡时间（UTC+5:30）
+# ✅ 斯里兰卡时间
 TZ = ZoneInfo("Asia/Colombo")
 
 def parse_admin_ids(raw: str) -> set[int]:
@@ -50,7 +50,7 @@ pool: asyncpg.Pool | None = None
 
 
 # =========================
-# 业务规则（每天 07:00 刷新）
+# 业务规则（每段刷新：07:00 & 19:00）
 # =========================
 DAILY_LIMITS = {
     "pee": 3,
@@ -71,6 +71,11 @@ KIND_CN = {
     "poop": "大便",
     "meal": "吃饭",
     "smoke": "抽烟",
+}
+
+SEG_CN = {
+    "DAY": "白班段(07:00-19:00)",
+    "NIGHT": "晚班段(19:00-次日07:00)",
 }
 
 QUOTES_START = [
@@ -96,7 +101,6 @@ CMD_ALIASES = {
     "/export": "export",
 }
 
-# 可选：纯文字（隐私模式开着可能收不到，但不影响 /命令）
 TEXT_ALIASES = {
     "吃饭": "meal",
     "小便": "pee",
@@ -109,7 +113,6 @@ TEXT_ALIASES = {
     "导出": "export",
 }
 
-# ✅ 中文键盘（仍然是 /命令）
 KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🍚 /meal 吃饭"), KeyboardButton(text="🚽 /pee 小便"), KeyboardButton(text="💩 /poop 大便")],
@@ -119,22 +122,8 @@ KB = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-
-# =========================
-# 时间口径：斯里兰卡 07:00 作为一天分界
-# =========================
 def now_sl() -> datetime:
     return datetime.now(tz=TZ)
-
-def work_day_by_7am(dt: datetime) -> date:
-    """
-    统计日：07:00 ~ 次日 07:00
-    - 07:00 之前算前一天
-    """
-    local_dt = dt.astimezone(TZ)
-    if local_dt.hour < 7:
-        return (local_dt - timedelta(days=1)).date()
-    return local_dt.date()
 
 def fmt_sl(dt: Optional[datetime]) -> str:
     if not dt:
@@ -167,11 +156,30 @@ async def safe_delete(chat_id: int, message_id: int):
 
 
 # =========================
+# 核心：按 07:00 / 19:00 分段归属
+# 返回 (segment_date, segment_type)
+# segment_date = 段起始所在日期
+# DAY: 当天 07:00-19:00 -> segment_date=当天
+# NIGHT: 当天 19:00-次日07:00 -> segment_date=当天
+# 凌晨 00:00-06:59 -> 属于昨天的 NIGHT（segment_date=昨天）
+# =========================
+def segment_key(dt: datetime) -> Tuple[date, str]:
+    local = dt.astimezone(TZ)
+    h = local.hour
+    if 7 <= h < 19:
+        return local.date(), "DAY"
+    if h >= 19:
+        return local.date(), "NIGHT"
+    # 00:00~06:59 -> 前一天 NIGHT
+    return (local.date() - timedelta(days=1)), "NIGHT"
+
+
+# =========================
 # DB（新表名，避免旧库冲突）
 # =========================
-TABLE_DAY = "day_summary_sl_7am_v1"      # 每天汇总（按 07:00 分界）
-TABLE_ACT = "active_session_sl_7am_v1"  # 当前进行中（每人最多一条）
-TABLE_EVT = "break_event_sl_7am_v1"     # 每次明细
+TABLE_SEG = "seg_summary_sl_7_19_v1"      # 每段汇总
+TABLE_ACT = "active_session_sl_7_19_v1"  # 当前进行中（每人最多一条）
+TABLE_EVT = "break_event_sl_7_19_v1"     # 每次明细
 
 
 async def db_init():
@@ -179,13 +187,15 @@ async def db_init():
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
 
     async with pool.acquire() as conn:
-        # 每日汇总
+        # 每段汇总（段=DAY/NIGHT）
         await conn.execute(f"""
-        CREATE TABLE IF NOT EXISTS {TABLE_DAY} (
+        CREATE TABLE IF NOT EXISTS {TABLE_SEG} (
             chat_id BIGINT NOT NULL,
             tg_user_id BIGINT NOT NULL,
             tg_name TEXT,
-            work_day DATE NOT NULL,              -- ✅ 统计日（07:00分界）
+            seg_date DATE NOT NULL,
+            seg_type TEXT NOT NULL,              -- DAY / NIGHT
+
             pee_count INT NOT NULL DEFAULT 0,
             pee_min   INT NOT NULL DEFAULT 0,
             poop_count INT NOT NULL DEFAULT 0,
@@ -194,21 +204,24 @@ async def db_init():
             meal_min   INT NOT NULL DEFAULT 0,
             smoke_count INT NOT NULL DEFAULT 0,
             smoke_min   INT NOT NULL DEFAULT 0,
+
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (chat_id, tg_user_id, work_day)
+            PRIMARY KEY (chat_id, tg_user_id, seg_date, seg_type)
         );
         """)
 
-        await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_day_workday_v1 ON {TABLE_DAY}(chat_id, work_day);")
-        await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_day_user_v1 ON {TABLE_DAY}(chat_id, tg_user_id);")
+        await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_seg_day_v1 ON {TABLE_SEG}(chat_id, seg_date);")
 
-        # 进行中
+        # 进行中（开始时就锁定 seg_date/seg_type，避免跨段混乱）
         await conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {TABLE_ACT} (
             chat_id BIGINT NOT NULL,
             tg_user_id BIGINT NOT NULL,
             tg_name TEXT,
-            work_day DATE NOT NULL,              -- ✅ 本次休息归属的统计日（按开始时间算）
+
+            seg_date DATE NOT NULL,
+            seg_type TEXT NOT NULL,              -- DAY/NIGHT
+
             kind TEXT NOT NULL,                  -- pee/poop/meal/smoke
             start_at TIMESTAMPTZ NOT NULL,
             start_msg BIGINT,
@@ -225,7 +238,10 @@ async def db_init():
             chat_id BIGINT NOT NULL,
             tg_user_id BIGINT NOT NULL,
             tg_name TEXT,
-            work_day DATE NOT NULL,              -- ✅ 按开始时间归属的统计日
+
+            seg_date DATE NOT NULL,
+            seg_type TEXT NOT NULL,              -- DAY/NIGHT
+
             kind TEXT NOT NULL,
             start_at TIMESTAMPTZ NOT NULL,
             end_at   TIMESTAMPTZ NOT NULL,
@@ -233,8 +249,7 @@ async def db_init():
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         """)
-        await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_evt_day_v1 ON {TABLE_EVT}(chat_id, work_day);")
-        await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_evt_user_v1 ON {TABLE_EVT}(chat_id, tg_user_id);")
+        await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_evt_seg_v1 ON {TABLE_EVT}(chat_id, seg_date, seg_type);")
 
 
 # =========================
@@ -247,23 +262,24 @@ async def get_active(chat_id: int, tg_user_id: int):
             chat_id, tg_user_id
         )
 
-async def set_active(chat_id: int, tg_user_id: int, tg_name: str, work_day: date,
+async def set_active(chat_id: int, tg_user_id: int, tg_name: str, seg_date: date, seg_type: str,
                      kind: str, start_at: datetime, start_msg: int, msg1: int, msg2: int):
     async with pool.acquire() as conn:
         await conn.execute(
             f"""
-            INSERT INTO {TABLE_ACT}(chat_id, tg_user_id, tg_name, work_day, kind, start_at, start_msg, msg1, msg2)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            INSERT INTO {TABLE_ACT}(chat_id, tg_user_id, tg_name, seg_date, seg_type, kind, start_at, start_msg, msg1, msg2)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
             ON CONFLICT(chat_id, tg_user_id) DO UPDATE
             SET tg_name=EXCLUDED.tg_name,
-                work_day=EXCLUDED.work_day,
+                seg_date=EXCLUDED.seg_date,
+                seg_type=EXCLUDED.seg_type,
                 kind=EXCLUDED.kind,
                 start_at=EXCLUDED.start_at,
                 start_msg=EXCLUDED.start_msg,
                 msg1=EXCLUDED.msg1,
                 msg2=EXCLUDED.msg2
             """,
-            chat_id, tg_user_id, tg_name, work_day, kind, start_at, start_msg, msg1, msg2
+            chat_id, tg_user_id, tg_name, seg_date, seg_type, kind, start_at, start_msg, msg1, msg2
         )
 
 async def clear_active(chat_id: int, tg_user_id: int):
@@ -278,56 +294,58 @@ async def clear_active(chat_id: int, tg_user_id: int):
         )
         return row
 
-async def get_kind_count(chat_id: int, tg_user_id: int, work_day: date, kind: str) -> int:
+async def get_kind_count(chat_id: int, tg_user_id: int, seg_date: date, seg_type: str, kind: str) -> int:
     col = f"{kind}_count"
     async with pool.acquire() as conn:
         v = await conn.fetchval(
             f"""
-            SELECT {col} FROM {TABLE_DAY}
-            WHERE chat_id=$1 AND tg_user_id=$2 AND work_day=$3
+            SELECT {col} FROM {TABLE_SEG}
+            WHERE chat_id=$1 AND tg_user_id=$2 AND seg_date=$3 AND seg_type=$4
             """,
-            chat_id, tg_user_id, work_day
+            chat_id, tg_user_id, seg_date, seg_type
         )
     return int(v or 0)
 
-async def add_break_to_day(chat_id: int, tg_user_id: int, tg_name: str, work_day: date, kind: str, used_min: int):
+async def add_break_to_seg(chat_id: int, tg_user_id: int, tg_name: str, seg_date: date, seg_type: str, kind: str, used_min: int):
     count_col = f"{kind}_count"
     min_col = f"{kind}_min"
     async with pool.acquire() as conn:
         await conn.execute(
             f"""
-            INSERT INTO {TABLE_DAY}(chat_id, tg_user_id, tg_name, work_day, {count_col}, {min_col})
-            VALUES($1,$2,$3,$4,1,$5)
-            ON CONFLICT(chat_id, tg_user_id, work_day) DO UPDATE
+            INSERT INTO {TABLE_SEG}(chat_id, tg_user_id, tg_name, seg_date, seg_type, {count_col}, {min_col})
+            VALUES($1,$2,$3,$4,$5,1,$6)
+            ON CONFLICT(chat_id, tg_user_id, seg_date, seg_type) DO UPDATE
             SET tg_name=EXCLUDED.tg_name,
-                {count_col} = {TABLE_DAY}.{count_col} + 1,
-                {min_col}   = {TABLE_DAY}.{min_col} + EXCLUDED.{min_col},
+                {count_col} = {TABLE_SEG}.{count_col} + 1,
+                {min_col}   = {TABLE_SEG}.{min_col} + EXCLUDED.{min_col},
                 updated_at=NOW()
             """,
-            chat_id, tg_user_id, tg_name, work_day, used_min
+            chat_id, tg_user_id, tg_name, seg_date, seg_type, used_min
         )
 
-async def insert_break_event(chat_id: int, tg_user_id: int, tg_name: str, work_day: date,
+async def insert_break_event(chat_id: int, tg_user_id: int, tg_name: str, seg_date: date, seg_type: str,
                             kind: str, start_at: datetime, end_at: datetime, used_min: int):
     async with pool.acquire() as conn:
         await conn.execute(
             f"""
-            INSERT INTO {TABLE_EVT}(chat_id, tg_user_id, tg_name, work_day, kind, start_at, end_at, used_min)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+            INSERT INTO {TABLE_EVT}(chat_id, tg_user_id, tg_name, seg_date, seg_type, kind, start_at, end_at, used_min)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
             """,
-            chat_id, tg_user_id, tg_name, work_day, kind, start_at, end_at, used_min
+            chat_id, tg_user_id, tg_name, seg_date, seg_type, kind, start_at, end_at, used_min
         )
 
-async def fetch_export_days(chat_id: int, start_day: date, end_day: date):
+async def fetch_export_segs(chat_id: int, start_day: date, end_day: date):
     async with pool.acquire() as conn:
         return await conn.fetch(
             f"""
-            SELECT work_day, tg_user_id, tg_name,
+            SELECT seg_date, seg_type, tg_user_id, tg_name,
                    pee_count, pee_min, poop_count, poop_min,
                    meal_count, meal_min, smoke_count, smoke_min
-            FROM {TABLE_DAY}
-            WHERE chat_id=$1 AND work_day BETWEEN $2 AND $3
-            ORDER BY work_day ASC, tg_user_id ASC
+            FROM {TABLE_SEG}
+            WHERE chat_id=$1 AND seg_date BETWEEN $2 AND $3
+            ORDER BY seg_date ASC,
+                     CASE WHEN seg_type='DAY' THEN 0 ELSE 1 END,
+                     tg_user_id ASC
             """,
             chat_id, start_day, end_day
         )
@@ -336,10 +354,12 @@ async def fetch_export_events(chat_id: int, start_day: date, end_day: date):
     async with pool.acquire() as conn:
         return await conn.fetch(
             f"""
-            SELECT work_day, tg_user_id, tg_name, kind, start_at, end_at, used_min
+            SELECT seg_date, seg_type, tg_user_id, tg_name, kind, start_at, end_at, used_min
             FROM {TABLE_EVT}
-            WHERE chat_id=$1 AND work_day BETWEEN $2 AND $3
-            ORDER BY work_day ASC, tg_user_id ASC, start_at ASC
+            WHERE chat_id=$1 AND seg_date BETWEEN $2 AND $3
+            ORDER BY seg_date ASC,
+                     CASE WHEN seg_type='DAY' THEN 0 ELSE 1 END,
+                     tg_user_id ASC, start_at ASC
             """,
             chat_id, start_day, end_day
         )
@@ -353,8 +373,9 @@ async def start_cmd(message: Message):
     if message.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         await message.reply(
             "✅ 休息计时机器人已启用（斯里兰卡时间 Asia/Colombo）\n\n"
-            "统计口径：每天【07:00】自动刷新次数\n"
-            "也就是：07:00 ~ 次日 07:00 算同一天\n\n"
+            "刷新口径：每天两段统计\n"
+            "白班段：07:00 ~ 19:00\n"
+            "晚班段：19:00 ~ 次日07:00\n\n"
             "用法：\n"
             "/meal 吃饭 | /pee 小便 | /poop 大便 | /smoke 抽烟\n"
             "/back 回来（结束本次并结算）\n\n"
@@ -365,6 +386,7 @@ async def start_cmd(message: Message):
         )
     else:
         await message.reply("请把机器人拉进群使用。", reply_markup=KB)
+
 
 @dp.message(Command("export"))
 async def export_cmd(message: Message):
@@ -377,7 +399,7 @@ async def export_cmd(message: Message):
         return await message.reply("你没有导出权限。")
 
     parts = (message.text or "").split()
-    today = work_day_by_7am(now_sl())
+    today = now_sl().date()
     start_day = end_day = today
 
     def parse_d(s: str) -> Optional[date]:
@@ -400,14 +422,15 @@ async def export_cmd(message: Message):
 
     wait = await message.reply("⏳ 正在导出请稍等…")
     try:
-        days = await fetch_export_days(message.chat.id, start_day, end_day)
+        segs = await fetch_export_segs(message.chat.id, start_day, end_day)
         events = await fetch_export_events(message.chat.id, start_day, end_day)
 
         # ===== 汇总 CSV =====
         buf1 = io.StringIO()
         w1 = csv.writer(buf1)
         w1.writerow([
-            "日期(统计日07:00-次日07:00,斯里兰卡)",
+            "日期(段起始日,斯里兰卡)",
+            "班段",
             "用户ID",
             "用户名",
             "小便次数", "小便总分钟",
@@ -416,11 +439,13 @@ async def export_cmd(message: Message):
             "抽烟次数", "抽烟总分钟",
         ])
 
-        for r in days:
-            uid_text = "\t" + str(int(r["tg_user_id"]))  # 防Excel科学计数
+        for r in segs:
+            uid_text = "\t" + str(int(r["tg_user_id"]))
             name_text = (r["tg_name"] or "").strip()
+            seg_type = r["seg_type"]
             w1.writerow([
-                str(r["work_day"]),
+                str(r["seg_date"]),
+                SEG_CN.get(seg_type, seg_type),
                 uid_text,
                 name_text,
                 int(r["pee_count"]), int(r["pee_min"]),
@@ -430,13 +455,14 @@ async def export_cmd(message: Message):
             ])
 
         data1 = buf1.getvalue().encode("utf-8-sig")
-        file1 = BufferedInputFile(data1, filename=f"休息汇总_{message.chat.id}_{start_day}_{end_day}.csv")
+        file1 = BufferedInputFile(data1, filename=f"休息汇总_两段_{message.chat.id}_{start_day}_{end_day}.csv")
 
         # ===== 明细 CSV =====
         buf2 = io.StringIO()
         w2 = csv.writer(buf2)
         w2.writerow([
-            "日期(统计日07:00-次日07:00,斯里兰卡)",
+            "日期(段起始日,斯里兰卡)",
+            "班段",
             "用户ID",
             "用户名",
             "类型",
@@ -448,10 +474,12 @@ async def export_cmd(message: Message):
         for e in events:
             uid_text = "\t" + str(int(e["tg_user_id"]))
             name_text = (e["tg_name"] or "").strip()
+            seg_type = e["seg_type"]
             kind = e["kind"]
             kind_cn = KIND_CN.get(kind, kind)
             w2.writerow([
-                str(e["work_day"]),
+                str(e["seg_date"]),
+                SEG_CN.get(seg_type, seg_type),
                 uid_text,
                 name_text,
                 kind_cn,
@@ -461,11 +489,10 @@ async def export_cmd(message: Message):
             ])
 
         data2 = buf2.getvalue().encode("utf-8-sig")
-        file2 = BufferedInputFile(data2, filename=f"休息明细_{message.chat.id}_{start_day}_{end_day}.csv")
+        file2 = BufferedInputFile(data2, filename=f"休息明细_两段_{message.chat.id}_{start_day}_{end_day}.csv")
 
         await message.answer_document(file1)
         await message.answer_document(file2)
-
         await wait.edit_text("✅ 导出完成（已发送：汇总 + 明细）")
     except Exception as e:
         await wait.edit_text(f"❌ 导出失败：{type(e).__name__}: {e}")
@@ -479,7 +506,6 @@ async def on_group_text(message: Message):
     raw = (message.text or "").strip()
     raw_lower = raw.lower()
 
-    # 抓第一个 /xxx（适配按钮文案）
     m = re.search(r"/[a-z]+", raw_lower)
     cmd = m.group(0) if m else (raw_lower.split()[0] if raw_lower else "")
 
@@ -495,37 +521,35 @@ async def on_group_text(message: Message):
     mention = mention_html(message)
     now = now_sl()
 
-    # 导出按钮等同 /export
     if kind == "export":
         message.text = "/export"
         return await export_cmd(message)
 
-    # 如果正在进行中，除 back 外都拦住
     active = await get_active(chat_id, tg_user_id)
     if active and kind != "back":
         return await message.reply("⚠️ 你当前还有进行中的状态，请先点【/back 回来】再继续。", reply_markup=KB)
 
-    # back：结束休息并结算（归属按开始时间的统计日）
+    # 回来：按“开始时锁定的班段”结算，避免跨 07:00/19:00 混到新段
     if kind == "back":
         if not active:
             return await message.reply("你当前没有进行中的记录。", reply_markup=KB)
 
         act = await clear_active(chat_id, tg_user_id)
         start_at = act["start_at"]
-        wd = act["work_day"]
+        seg_date = act["seg_date"]
+        seg_type = act["seg_type"]
         bk = act["kind"]
 
         used_min = int(max(0, (now - start_at).total_seconds() // 60))
 
-        # 写明细 + 汇总累加
-        await insert_break_event(chat_id, tg_user_id, tg_name, wd, bk, start_at, now, used_min)
-        await add_break_to_day(chat_id, tg_user_id, tg_name, wd, bk, used_min)
+        await insert_break_event(chat_id, tg_user_id, tg_name, seg_date, seg_type, bk, start_at, now, used_min)
+        await add_break_to_seg(chat_id, tg_user_id, tg_name, seg_date, seg_type, bk, used_min)
 
-        used_cnt = await get_kind_count(chat_id, tg_user_id, wd, bk)
+        used_cnt = await get_kind_count(chat_id, tg_user_id, seg_date, seg_type, bk)
         limit = DAILY_LIMITS.get(bk, 999)
         left = max(0, limit - used_cnt)
 
-        # 删除过程消息（可删就删）
+        # 删除过程消息
         to_delete = []
         if act.get("start_msg"):
             to_delete.append(int(act["start_msg"]))
@@ -548,34 +572,32 @@ async def on_group_text(message: Message):
         return await message.answer(
             f"✅ {mention} 已回来：本次【{KIND_CN.get(bk, bk)}】用时 {used_min} 分钟。"
             f"{extra}\n"
-            f"📌 归属统计日：{wd}（07:00~次日07:00）\n"
-            f"本日已用 {used_cnt}/{limit} 次，剩余 {left} 次。\n"
+            f"📌 归属：{seg_date} - {SEG_CN.get(seg_type, seg_type)}\n"
+            f"本段已用 {used_cnt}/{limit} 次，剩余 {left} 次。\n"
             f"{quote}",
             reply_markup=KB,
             parse_mode=ParseMode.HTML
         )
 
-    # 开始休息：按“现在时间”算统计日
-    wd = work_day_by_7am(now)
+    # 开始休息：用当前时间计算所属段（07/19 自动切段）
+    seg_date, seg_type = segment_key(now)
 
-    # 次数限制：按统计日统计
-    used_cnt = await get_kind_count(chat_id, tg_user_id, wd, kind)
+    used_cnt = await get_kind_count(chat_id, tg_user_id, seg_date, seg_type, kind)
     limit = DAILY_LIMITS.get(kind, 999)
     if used_cnt >= limit:
         return await message.reply(
-            f"⛔️ 今日【{KIND_CN.get(kind, kind)}】次数已满：{used_cnt}/{limit}\n"
-            f"📌 统计日：{wd}（07:00~次日07:00）",
+            f"⛔️ 本段【{KIND_CN.get(kind, kind)}】次数已满：{used_cnt}/{limit}\n"
+            f"📌 归属：{seg_date} - {SEG_CN.get(seg_type, seg_type)}",
             reply_markup=KB
         )
 
     minutes = DEFAULT_MINUTES.get(kind, 10)
     deadline = (now + timedelta(minutes=minutes)).astimezone(TZ).strftime("%H:%M")
-
     quote = random.choice(QUOTES_START)
 
     msg1 = await message.answer(
         f"📝 {mention} 已记录：{KIND_CN.get(kind, kind)}（第 {used_cnt + 1}/{limit} 次）\n"
-        f"📌 统计日：{wd}（07:00~次日07:00）\n"
+        f"📌 归属：{seg_date} - {SEG_CN.get(seg_type, seg_type)}\n"
         f"{quote}",
         reply_markup=KB,
         parse_mode=ParseMode.HTML
@@ -588,7 +610,9 @@ async def on_group_text(message: Message):
     )
 
     await set_active(
-        chat_id, tg_user_id, tg_name, wd, kind, now,
+        chat_id, tg_user_id, tg_name,
+        seg_date, seg_type,
+        kind, now,
         message.message_id,
         msg1.message_id,
         msg2.message_id
