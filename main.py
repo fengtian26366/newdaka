@@ -31,11 +31,11 @@ if not DATABASE_URL:
 TZ = ZoneInfo("Asia/Colombo")  # 斯里兰卡时间
 DAY_CUT = time(7, 0)           # 07:00 切日
 
-# ✅ 新表名：避免旧库冲突（关键）
-T_SUM = "shift_summary_sl_v2"
-T_ACT = "active_session_sl_v2"
-T_PREF = "user_shift_pref_sl_v2"
-T_USERS = "users_seen_sl_v2"
+# ✅ 新表名：避免和你之前旧表冲突（很关键）
+T_SUM = "shift_summary_sl_v3"
+T_ACT = "active_session_sl_v3"
+T_PREF = "user_shift_pref_sl_v3"
+T_USERS = "users_seen_sl_v3"
 
 
 def parse_admin_ids(raw: str) -> set[int]:
@@ -57,7 +57,7 @@ pool: asyncpg.Pool | None = None
 
 
 # =========================
-# 休息规则（不需要上班/下班）
+# 规则
 # =========================
 DAILY_LIMITS = {
     "pee": 3,
@@ -80,20 +80,6 @@ KIND_CN = {
     "smoke": "抽烟",
 }
 
-# 命令别名（兼容 /xxx@botname）
-CMD_ALIASES = {
-    "/meal": "meal",
-    "/pee": "pee",
-    "/poop": "poop",
-    "/smoke": "smoke",
-    "/back": "back",
-    "/export": "export",
-    "/use": "use",
-    "/who": "who",
-    "/ping": "ping",
-    "/missed": "missed",
-}
-
 TEXT_ALIASES = {
     "吃饭": "meal",
     "小便": "pee",
@@ -103,8 +89,6 @@ TEXT_ALIASES = {
     "回来": "back",
     "回": "back",
     "back": "back",
-    "导出": "export",
-    "缺卡": "missed",
 }
 
 KB = ReplyKeyboardMarkup(
@@ -169,14 +153,15 @@ async def safe_delete(chat_id: int, message_id: int):
         pass
 
 
-def extract_cmd(text: str) -> str:
-    """兼容：/pee@YourBot"""
-    m = re.match(r"^/([a-zA-Z_]+)(?:@[\w_]+)?", (text or "").strip())
-    return f"/{m.group(1).lower()}" if m else ""
+def parse_date_ymd(s: str) -> Optional[date]:
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        return None
 
 
 # =========================
-# DB 初始化（新表 v2）
+# DB 初始化
 # =========================
 async def db_init():
     global pool
@@ -221,7 +206,7 @@ async def db_init():
             tg_user_id BIGINT NOT NULL,
             work_day DATE NOT NULL,
             shift TEXT NOT NULL,
-            kind TEXT NOT NULL,
+            kind TEXT NOT NULL,              -- pee/poop/meal/smoke
             start_at TIMESTAMPTZ NOT NULL,
             start_msg BIGINT,
             msg1 BIGINT,
@@ -234,13 +219,13 @@ async def db_init():
         CREATE TABLE IF NOT EXISTS {T_PREF} (
             chat_id BIGINT NOT NULL,
             tg_user_id BIGINT NOT NULL,
-            shift TEXT NOT NULL,
+            shift TEXT NOT NULL,             -- 白班/夜班
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             PRIMARY KEY (chat_id, tg_user_id)
         );
         """)
 
-        await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_sum_day_shift_v2 ON {T_SUM}(chat_id, work_day, shift);")
+        await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_sum_day_shift_v3 ON {T_SUM}(chat_id, work_day, shift);")
 
 
 # =========================
@@ -342,7 +327,7 @@ async def add_break_result(chat_id: int, tg_user_id: int, wd: date, shift: str, 
         """, used_min, chat_id, tg_user_id, wd, shift)
 
 
-async def fetch_export(chat_id: int, d: date, shift: Optional[str] = None):
+async def fetch_export(chat_id: int, start_day: date, end_day: date, shift: Optional[str] = None):
     async with pool.acquire() as conn:
         if shift in ("白班", "夜班"):
             return await conn.fetch(f"""
@@ -350,28 +335,29 @@ async def fetch_export(chat_id: int, d: date, shift: Optional[str] = None):
                    pee_count, pee_min, poop_count, poop_min,
                    meal_count, meal_min, smoke_count, smoke_min
             FROM {T_SUM}
-            WHERE chat_id=$1 AND work_day=$2 AND shift=$3
-            ORDER BY tg_user_id ASC
-            """, chat_id, d, shift)
+            WHERE chat_id=$1 AND work_day BETWEEN $2 AND $3 AND shift=$4
+            ORDER BY work_day ASC, tg_user_id ASC
+            """, chat_id, start_day, end_day, shift)
+
         return await conn.fetch(f"""
         SELECT work_day, shift, tg_user_id, tg_name,
                pee_count, pee_min, poop_count, poop_min,
                meal_count, meal_min, smoke_count, smoke_min
         FROM {T_SUM}
-        WHERE chat_id=$1 AND work_day=$2
-        ORDER BY shift ASC, tg_user_id ASC
-        """, chat_id, d)
+        WHERE chat_id=$1 AND work_day BETWEEN $2 AND $3
+        ORDER BY work_day ASC, shift ASC, tg_user_id ASC
+        """, chat_id, start_day, end_day)
 
 
 async def fetch_seen_users(chat_id: int):
     async with pool.acquire() as conn:
-        return await conn.fetch(f"SELECT tg_user_id, tg_name FROM {T_USERS} WHERE chat_id=$1 ORDER BY tg_user_id ASC", chat_id)
+        return await conn.fetch(
+            f"SELECT tg_user_id, tg_name FROM {T_USERS} WHERE chat_id=$1 ORDER BY tg_user_id ASC",
+            chat_id
+        )
 
 
 async def fetch_present_users(chat_id: int, d: date):
-    """
-    认为“有打卡”的口径：当天该班次有任何累计（count>0）就算有。
-    """
     async with pool.acquire() as conn:
         return await conn.fetch(f"""
         SELECT tg_user_id, shift,
@@ -379,6 +365,90 @@ async def fetch_present_users(chat_id: int, d: date):
         FROM {T_SUM}
         WHERE chat_id=$1 AND work_day=$2
         """, chat_id, d)
+
+
+# =========================
+# 核心处理：统一逻辑（命令与文本都走这里）
+# =========================
+async def handle_kind_message(message: Message, kind: str):
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
+    chat_id = message.chat.id
+    tg_user_id = message.from_user.id
+    tg_name = get_tg_name(message)
+    mention = mention_html(message)
+
+    await touch_user(chat_id, tg_user_id, tg_name)
+
+    now = now_sl()
+    wd = work_day(now)
+    shift = await get_user_shift(chat_id, tg_user_id, now)
+
+    await ensure_summary_row(chat_id, tg_user_id, tg_name, wd, shift)
+
+    active = await get_active(chat_id, tg_user_id)
+
+    # 有进行中：只能 back
+    if active and kind != "back":
+        return await message.reply("⚠️ 你当前还有进行中的状态，请先 /back 再继续。", reply_markup=KB)
+
+    # back：结算
+    if kind == "back":
+        if not active:
+            return await message.reply("没有进行中的记录。", reply_markup=KB)
+
+        act = await clear_active(chat_id, tg_user_id)
+        used_min = int(max(0, (now - act["start_at"]).total_seconds() // 60))
+        bk = act["kind"]
+        act_wd = act["work_day"]
+        act_shift = act["shift"]
+
+        await ensure_summary_row(chat_id, tg_user_id, tg_name, act_wd, act_shift)
+        await add_break_result(chat_id, tg_user_id, act_wd, act_shift, bk, used_min)
+
+        # 删除过程消息
+        for mid in [act.get("start_msg"), act.get("msg1"), act.get("msg2"), message.message_id]:
+            if mid:
+                await safe_delete(chat_id, int(mid))
+
+        limit_min = DEFAULT_MINUTES.get(bk, 0)
+        overtime = max(0, used_min - limit_min) if limit_min else 0
+        extra = f"（超时 {overtime} 分钟）" if overtime > 0 else "（未超时）"
+
+        return await message.answer(
+            f"✅ {mention} 已回来：本次【{KIND_CN.get(bk, bk)}】用时 {used_min} 分钟 {extra}\n"
+            f"归属：{act_wd} {act_shift}",
+            reply_markup=KB,
+            parse_mode=ParseMode.HTML
+        )
+
+    # 次数限制
+    used_cnt = await get_kind_count(chat_id, tg_user_id, wd, shift, kind)
+    limit = DAILY_LIMITS.get(kind, 999)
+    if used_cnt >= limit:
+        return await message.reply(
+            f"⛔️ 今日（{wd} {shift}）【{KIND_CN.get(kind, kind)}】次数已满：{used_cnt}/{limit}。",
+            reply_markup=KB
+        )
+
+    minutes = DEFAULT_MINUTES.get(kind, 10)
+    deadline = (now + timedelta(minutes=minutes)).astimezone(TZ).strftime("%H:%M")
+
+    msg1 = await message.answer(
+        f"📝 {mention} 已记录：{KIND_CN.get(kind, kind)}（第 {used_cnt + 1}/{limit} 次）\n"
+        f"归属：{wd} {shift}",
+        reply_markup=KB,
+        parse_mode=ParseMode.HTML
+    )
+    msg2 = await message.answer(
+        f"⏰ {mention} 请在 {deadline} 前回来（提示值 {minutes} 分钟）。\n"
+        f"结束请发 /back",
+        reply_markup=KB,
+        parse_mode=ParseMode.HTML
+    )
+
+    await set_active(chat_id, tg_user_id, wd, shift, kind, now, message.message_id, msg1.message_id, msg2.message_id)
 
 
 # =========================
@@ -390,9 +460,12 @@ async def start_cmd(message: Message):
         "✅ 打卡机器人已启用（斯里兰卡时间）\n\n"
         "开始：/meal /pee /poop /smoke\n"
         "结束：/back（结算本次用时）\n"
-        "共用号切班：/use 白班 或 /use 夜班（不设就自动按时间判班）\n\n"
-        "导出（管理员）：/export 2026-02-18  或 /export 2026-02-18 白班\n"
-        "缺卡（管理员）：/missed 2026-02-18\n",
+        "共用号切班：/use 白班 或 /use 夜班（不设就按时间自动判班）\n\n"
+        "导出（管理员）：\n"
+        "/export 2026-02-18\n"
+        "/export 2026-02-18 2026-02-21\n"
+        "/export 2026-02-18 2026-02-21 白班|夜班\n\n"
+        "缺卡（管理员）：/missed 2026-02-18",
         reply_markup=KB
     )
 
@@ -426,6 +499,32 @@ async def who_cmd(message: Message):
     await message.reply(f"当前：{shift} | 工作日：{wd}（07:00~次日07:00）", reply_markup=KB)
 
 
+# ✅ 命令：休息开始/结束（关键：不再依赖 F.text）
+@dp.message(Command("meal"))
+async def cmd_meal(message: Message):
+    return await handle_kind_message(message, "meal")
+
+
+@dp.message(Command("pee"))
+async def cmd_pee(message: Message):
+    return await handle_kind_message(message, "pee")
+
+
+@dp.message(Command("poop"))
+async def cmd_poop(message: Message):
+    return await handle_kind_message(message, "poop")
+
+
+@dp.message(Command("smoke"))
+async def cmd_smoke(message: Message):
+    return await handle_kind_message(message, "smoke")
+
+
+@dp.message(Command("back"))
+async def cmd_back(message: Message):
+    return await handle_kind_message(message, "back")
+
+
 @dp.message(Command("export"))
 async def export_cmd(message: Message):
     if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
@@ -435,20 +534,35 @@ async def export_cmd(message: Message):
 
     parts = (message.text or "").split()
     if len(parts) < 2:
-        return await message.reply("格式：/export 2026-02-18  或  /export 2026-02-18 白班")
+        return await message.reply(
+            "格式：\n"
+            "/export 2026-02-18\n"
+            "/export 2026-02-18 2026-02-21\n"
+            "/export 2026-02-18 2026-02-21 白班|夜班"
+        )
 
-    try:
-        d = datetime.strptime(parts[1], "%Y-%m-%d").date()
-    except Exception:
-        return await message.reply("格式：/export 2026-02-18")
+    d1 = parse_date_ymd(parts[1])
+    if not d1:
+        return await message.reply("日期格式错误：请用 YYYY-MM-DD")
 
+    start_day = end_day = d1
     want_shift = None
-    if len(parts) >= 3 and parts[2] in ("白班", "夜班"):
-        want_shift = parts[2]
+
+    if len(parts) >= 3:
+        d2 = parse_date_ymd(parts[2])
+        if d2:
+            start_day, end_day = (d1, d2) if d1 <= d2 else (d2, d1)
+            if len(parts) >= 4 and parts[3] in ("白班", "夜班"):
+                want_shift = parts[3]
+        else:
+            if parts[2] in ("白班", "夜班"):
+                want_shift = parts[2]
+            else:
+                return await message.reply("格式错误：/export 2026-02-18 2026-02-21  或  /export 2026-02-18 白班")
 
     wait = await message.reply("⏳ 正在导出请稍等…")
     try:
-        rows = await fetch_export(message.chat.id, d, want_shift)
+        rows = await fetch_export(message.chat.id, start_day, end_day, want_shift)
 
         buf = io.StringIO()
         w = csv.writer(buf)
@@ -466,7 +580,6 @@ async def export_cmd(message: Message):
         for r in rows:
             uid_text = "\t" + str(int(r["tg_user_id"]))
             name_text = (r["tg_name"] or "").strip()
-
             w.writerow([
                 str(r["work_day"]),
                 r["shift"],
@@ -480,7 +593,7 @@ async def export_cmd(message: Message):
 
         data = buf.getvalue().encode("utf-8-sig")
         suffix = want_shift if want_shift else "全部"
-        filename = f"打卡汇总_{message.chat.id}_{d}_{suffix}.csv"
+        filename = f"打卡汇总_{message.chat.id}_{start_day}_{end_day}_{suffix}.csv"
         await message.answer_document(BufferedInputFile(data, filename=filename))
         await wait.edit_text("✅ 导出完成")
     except Exception as e:
@@ -498,10 +611,9 @@ async def missed_cmd(message: Message):
     if len(parts) < 2:
         return await message.reply("格式：/missed 2026-02-18")
 
-    try:
-        d = datetime.strptime(parts[1], "%Y-%m-%d").date()
-    except Exception:
-        return await message.reply("格式：/missed 2026-02-18")
+    d = parse_date_ymd(parts[1])
+    if not d:
+        return await message.reply("日期格式错误：/missed 2026-02-18")
 
     seen = await fetch_seen_users(message.chat.id)
     present_rows = await fetch_present_users(message.chat.id, d)
@@ -542,51 +654,33 @@ async def missed_cmd(message: Message):
 
 
 # =========================
-# 群消息统一入口
+# 兼容：纯文字（可选）
 # =========================
 @dp.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}) & F.text)
 async def on_group_text(message: Message):
     raw = (message.text or "").strip()
-    cmd = extract_cmd(raw)
 
-    chat_id = message.chat.id
-    tg_user_id = message.from_user.id
-    tg_name = get_tg_name(message)
-    mention = mention_html(message)
+    # 如果是 /命令，交给 Command handlers（避免重复）
+    if raw.startswith("/"):
+        return
 
-    # 只要说过话/点过按钮，就登记出现过
-    await touch_user(chat_id, tg_user_id, tg_name)
-
-    kind = CMD_ALIASES.get(cmd)
-    if not kind:
-        kind = TEXT_ALIASES.get(raw) or TEXT_ALIASES.get(raw.lower())
+    kind = TEXT_ALIASES.get(raw) or TEXT_ALIASES.get(raw.lower())
     if not kind:
         return
 
-    now = now_sl()
-    wd = work_day(now)
-    shift = await get_user_shift(chat_id, tg_user_id, now)
-
-    # 注意：export/missed 在各自 handler 已处理，这里不重复处理也可以
-    if kind in ("export", "missed"):
-        return
-
-    await ensure_summary_row(chat_id, tg_user_id, tg_name, wd, shift)
-
-    active = await get_active(chat_id, tg_user_id)
-    if active and kind != "back":
-        return await message.reply("⚠️ 你当前还有进行中的状态，请先 /back 再继续。", reply_markup=KB)
-
-    # back：结算
     if kind == "back":
-        if not active:
-            return await message.reply("没有进行中的记录。", reply_markup=KB)
+        return await handle_kind_message(message, "back")
+    return await handle_kind_message(message, kind)
 
-        act = await clear_active(chat_id, tg_user_id)
-        used_min = int(max(0, (now - act["start_at"]).total_seconds() // 60))
-        bk = act["kind"]
-        act_wd = act["work_day"]
-        act_shift = act["shift"]
 
-        await ensure_summary_row(chat_id, tg_user_id, tg_name, act_wd, act_shift)
-        await add_break_re
+# =========================
+# 启动
+# =========================
+async def main():
+    await db_init()
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("[bot] polling started")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
