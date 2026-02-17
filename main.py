@@ -95,7 +95,6 @@ KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="/meal 吃饭"), KeyboardButton(text="/pee 小便"), KeyboardButton(text="/poop 大便")],
         [KeyboardButton(text="/smoke 抽烟"), KeyboardButton(text="/back 回来")],
-        [KeyboardButton(text="/use 白班"), KeyboardButton(text="/use 夜班")],
         [KeyboardButton(text="/export 导出"), KeyboardButton(text="/missed 缺卡")],
     ],
     resize_keyboard=True
