@@ -390,7 +390,7 @@ async def handle_kind_message(message: Message, kind: str):
 
     # 有进行中：只能 back
     if active and kind != "back":
-        return await message.reply("⚠️ 你当前还有进行中的状态，请先 /back 再继续。", reply_markup=KB)
+        return await message.reply("⚠️ 你当前还有进行中的状态，请先回来 /back 再继续。", reply_markup=KB)
 
     # back：结算
     if kind == "back":
@@ -427,8 +427,8 @@ async def handle_kind_message(message: Message, kind: str):
     limit = DAILY_LIMITS.get(kind, 999)
     if used_cnt >= limit:
         return await message.reply(
-            f"⛔️ 今日（{wd} {shift}）【{KIND_CN.get(kind, kind)}】次数已满：{used_cnt}/{limit}。",
-            reply_markup=KB
+            f"⛔️ 今日（{wd} {shift}）【{KIND_CN.get(kind, kind)}】次数已满,如有急事请找领班申请次数：{used_cnt}/{limit}。",
+            reply_markup=KB 
         )
 
     minutes = DEFAULT_MINUTES.get(kind, 10)
